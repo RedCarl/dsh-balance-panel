@@ -1,0 +1,8 @@
+# Left-sidebar balance panel: account balance + custom API balances.
+# The Host half owns the /plugins/balance-panel/state route and the session
+# refresh trigger; the Client half renders the sidebar entry and the page.
+- insert:
+    - id: balance-panel
+      name: '@local/dsh-balance-panel'
+      config:
+        cacheTtlMs: 30000

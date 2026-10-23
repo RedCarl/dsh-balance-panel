@@ -1,0 +1,1172 @@
+/**
+ * @local/dsh-balance-panel — Host half.
+ *
+ * Collects the signed-in DeepSeek account balance and the balances (or plan
+ * usage) of every API provider this machine has a credential for, then serves
+ * one JSON snapshot on `GET /plugins/balance-panel/state`.
+ *
+ * A credential-driven provider is discovered from `ctx.credentials.describe`
+ * and, when a provider was added through Settings → Models, from the live
+ * `llm-pi-ai` settings document. The signed-in account comes from
+ * `ctx.deepseekAccount`, so no token ever reaches the browser.
+ *
+ * When a session finishes a turn (`agent/status` → idle) the snapshot is
+ * refreshed shortly afterwards so the left-sidebar entry can show the latest
+ * amount and raise its session-update reminder.
+ */
+
+/** Stable route used by the browser half. */
+export const ROUTE = '/plugins/balance-panel/state';
+
+/** Services required before the route can mount. */
+export const inject = ['webServer'];
+
+const DEFAULT_CACHE_TTL_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 12_000;
+const MAX_CHANGES = 6;
+
+/** Fixed provider adapters, in display order. */
+const ADAPTERS = [
+  {
+    id: 'deepseek',
+    providerIds: ['deepseek-official', 'deepseek'],
+    settingsNs: 'llm-deepseek',
+    keyEnv: 'DEEPSEEK_API_KEY',
+    base: 'https://api.deepseek.com',
+    modelHint: 'deepseek-chat',
+    query: 'deepseek',
+  },
+  {
+    id: 'opencode-go',
+    providerIds: ['opencode-go'],
+    settingsNs: 'llm-pi-ai',
+    keyEnv: 'OPENCODE_GO_API_KEY',
+    altKeyEnv: 'OPENCODE_API_KEY',
+    base: 'https://opencode.ai/zen/go/v1',
+    modelHint: 'opencode-go',
+    query: 'opencode',
+  },
+  {
+    id: 'moonshot',
+    providerIds: ['moonshot', 'kimi', 'moonshot-ai'],
+    keyEnv: 'MOONSHOT_API_KEY',
+    base: 'https://api.moonshot.cn/v1',
+    modelHint: 'kimi-latest',
+    query: 'moonshot',
+  },
+  {
+    id: 'zhipu',
+    providerIds: ['zhipu', 'glm', 'zhipuai'],
+    keyEnv: 'ZHIPU_API_KEY',
+    base: 'https://open.bigmodel.cn/api/paas/v4',
+    modelHint: 'glm-4.5',
+    query: 'zhipu',
+  },
+  {
+    id: 'openrouter',
+    providerIds: ['openrouter'],
+    keyEnv: 'OPENROUTER_API_KEY',
+    base: 'https://openrouter.ai/api/v1',
+    modelHint: 'openrouter/auto',
+    query: 'openrouter',
+  },
+];
+
+/** Trim a URL's trailing slash. */
+function trimUrl(value) {
+  return String(value ?? '').trim().replace(/\/+$/, '');
+}
+
+/** Origin of a URL, or the trimmed value when it does not parse. */
+function originOf(value) {
+  const trimmed = trimUrl(value);
+  if (trimmed === '') return '';
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return trimmed;
+  }
+}
+
+/** Strip a trailing `/v1` so provider-specific roots can be appended. */
+function apiRoot(value) {
+  const trimmed = trimUrl(value);
+  return /\/v1$/i.test(trimmed) ? trimmed.slice(0, -3) : trimmed;
+}
+
+/** Join an endpoint path onto a base URL. */
+function joinUrl(base, path) {
+  const root = trimUrl(base);
+  if (path.startsWith('http://') || path.startsWith('https://')) return path;
+  return `${root}${path.startsWith('/') ? '' : '/'}${path}`;
+}
+
+/** Coerce a value to a finite number, or undefined. */
+function num(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+/** Decimal string from a number or decimal string. */
+function dec(value, fallback) {
+  const parsed = num(value);
+  if (parsed === undefined) return fallback;
+  return String(parsed);
+}
+
+/** Normalize a currency code. */
+function currencyOf(value, fallback = 'CNY') {
+  if (typeof value !== 'string' || value.trim() === '') return fallback;
+  return value.trim().toUpperCase();
+}
+
+/** Read a dotted path out of plain JSON. */
+function pathGet(value, path) {
+  if (typeof path !== 'string' || path === '') return undefined;
+  let current = value;
+  for (const part of path.split('.')) {
+    if (current === null || current === undefined) return undefined;
+    if (/^\d+$/.test(part)) {
+      if (!Array.isArray(current)) return undefined;
+      current = current[Number(part)];
+    } else {
+      if (typeof current !== 'object') return undefined;
+      current = current[part];
+    }
+  }
+  return current;
+}
+
+/** Recursively look for a plausible amount field in an unknown JSON payload. */
+function findAmount(value, depth = 0) {
+  if (depth > 3 || value === null || typeof value !== 'object') return undefined;
+  const keys = [
+    'available_balance',
+    'total_balance',
+    'availableBalance',
+    'totalBalance',
+    'limit_remaining',
+    'remaining',
+    'balance',
+    'credits',
+    'amount',
+  ];
+  for (const key of keys) {
+    const hit = num(value[key]);
+    if (hit !== undefined) {
+      return {
+        amount: hit,
+        currency: currencyOf(value.currency ?? value.unit, 'USD'),
+      };
+    }
+  }
+  for (const child of Object.values(value)) {
+    const hit = findAmount(child, depth + 1);
+    if (hit !== undefined) return hit;
+  }
+  return undefined;
+}
+
+/** Fetch a JSON endpoint with a timeout and an optional abort signal. */
+async function fetchJson(url, headers, timeoutMs, signal) {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (signal !== undefined) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { accept: 'application/json', ...headers },
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let body;
+    try {
+      body = text === '' ? undefined : JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
+    return { ok: response.ok, status: response.status, body, text };
+  } finally {
+    clearTimeout(timer);
+    if (signal !== undefined) signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/** Parse DeepSeek's `/user/balance` reply. */
+function parseDeepSeek(body) {
+  const infos = body?.balance_infos;
+  if (!Array.isArray(infos) || infos.length === 0) return undefined;
+  const wallets = [];
+  for (const info of infos) {
+    const amount = num(info?.total_balance);
+    if (amount === undefined) continue;
+    wallets.push({
+      currency: currencyOf(info?.currency, 'CNY'),
+      amount: dec(info.total_balance),
+      granted: num(info.granted_balance) === undefined ? undefined : dec(info.granted_balance),
+      toppedUp: num(info.topped_up_balance) === undefined ? undefined : dec(info.topped_up_balance),
+    });
+  }
+  return wallets.length === 0 ? undefined : { wallets };
+}
+
+/** Parse Moonshot's `/v1/users/me/balance` reply. */
+function parseMoonshot(body) {
+  const data = body?.data ?? body;
+  const amount = num(data?.available_balance) ?? num(data?.balance) ?? num(data?.cash_balance);
+  if (amount === undefined) return undefined;
+  return {
+    wallets: [
+      {
+        currency: currencyOf(data?.currency, 'CNY'),
+        amount: dec(amount),
+        granted: num(data?.voucher_balance) === undefined ? undefined : dec(data.voucher_balance),
+        toppedUp: num(data?.cash_balance) === undefined ? undefined : dec(data.cash_balance),
+      },
+    ],
+  };
+}
+
+/** Parse Zhipu's `/api/paas/v4/balance` reply. */
+function parseZhipu(body) {
+  const data = body?.data ?? body;
+  const amount = num(data?.balance) ?? num(data?.total) ?? num(data?.available);
+  if (amount === undefined) return undefined;
+  return {
+    wallets: [{ currency: currencyOf(data?.currency, 'CNY'), amount: dec(amount) }],
+  };
+}
+
+/** Parse OpenRouter's `/api/v1/credits` reply. */
+function parseOpenRouter(body) {
+  const data = body?.data ?? body;
+  const total = num(data?.total_credits);
+  const used = num(data?.total_usage);
+  let remaining;
+  if (total !== undefined && used !== undefined) remaining = total - used;
+  else remaining = num(data?.limit_remaining) ?? num(data?.remaining) ?? num(data?.credits);
+  if (remaining === undefined) return undefined;
+  return {
+    wallets: [
+      {
+        currency: 'USD',
+        amount: dec(Math.max(0, remaining)),
+        granted: total === undefined ? undefined : dec(total),
+        toppedUp: used === undefined ? undefined : dec(used),
+        grantedLabel: 'credits',
+        toppedUpLabel: 'used',
+      },
+    ],
+  };
+}
+
+/** Parse opencode Go's `/zen/go/v1/usage` reply into plan windows. */
+function parseOpencodeUsage(body) {
+  const usage = body?.usage ?? body?.data?.usage ?? body?.data ?? body;
+  const windows = {};
+  for (const name of ['rolling', 'weekly', 'monthly']) {
+    const raw = usage?.[name];
+    if (raw === null || typeof raw !== 'object') continue;
+    const percent = num(raw.percent);
+    if (percent === undefined) continue;
+    windows[name] = {
+      percent: Math.max(0, Math.min(100, percent)),
+      status: typeof raw.status === 'string' ? raw.status : 'ok',
+      resetsAt: typeof raw.resetsAt === 'string' ? raw.resetsAt : undefined,
+    };
+  }
+  if (Object.keys(windows).length === 0) return undefined;
+  return { usage: windows };
+}
+
+/** Parse a New API gateway's subscription reply. */
+function parseNewApiLimit(body) {
+  const data = body?.data ?? body;
+  return (
+    num(data?.soft_limit_usd) ??
+    num(data?.hard_limit_usd) ??
+    num(data?.system_hard_limit_usd) ??
+    num(data?.limit) ??
+    num(data?.total_granted)
+  );
+}
+
+/** Parse a New API gateway's usage reply (cents). */
+function parseNewApiUsage(body) {
+  const data = body?.data ?? body;
+  const cents = num(data?.total_usage) ?? num(data?.totalUsage) ?? num(data?.usage);
+  if (cents === undefined) return undefined;
+  return cents / 100;
+}
+
+/** Pick the endpoint dialect from a configured endpoint or provider id. */
+function queryForBase(baseURL, providerId) {
+  const lower = String(baseURL ?? '').toLowerCase();
+  const id = String(providerId ?? '').toLowerCase();
+  if (lower.includes('api.deepseek.com') || id.includes('deepseek')) return 'deepseek';
+  if (lower.includes('opencode.ai') || id.includes('opencode')) return 'opencode';
+  if (lower.includes('moonshot') || id.includes('moonshot') || id.includes('kimi')) return 'moonshot';
+  if (lower.includes('bigmodel') || id.includes('zhipu') || id.includes('glm')) return 'zhipu';
+  if (lower.includes('openrouter')) return 'openrouter';
+  return 'newapi';
+}
+
+/** Query one provider and normalize the outcome. */
+async function queryProvider(adapter, options) {
+  const { baseURL, apiKey, timeoutMs, signal } = options;
+  const headers = { authorization: `Bearer ${apiKey}` };
+  const kind = adapter.query;
+  try {
+    if (kind === 'deepseek') {
+      const url = `${apiRoot(baseURL)}/user/balance`;
+      const response = await fetchJson(url, headers, timeoutMs, signal);
+      const parsed = response.ok ? parseDeepSeek(response.body) : undefined;
+      if (parsed === undefined) {
+        return { ok: false, error: `HTTP ${response.status}`, endpoint: url, kind: 'balance' };
+      }
+      return { ok: true, endpoint: url, kind: 'balance', ...parsed };
+    }
+    if (kind === 'moonshot') {
+      const trimmed = trimUrl(baseURL);
+      const url = /\/v1$/i.test(trimmed)
+        ? `${trimmed}/users/me/balance`
+        : `${trimmed}/v1/users/me/balance`;
+      const response = await fetchJson(url, headers, timeoutMs, signal);
+      const parsed = response.ok ? parseMoonshot(response.body) : undefined;
+      if (parsed === undefined) {
+        return { ok: false, error: `HTTP ${response.status}`, endpoint: url, kind: 'balance' };
+      }
+      return { ok: true, endpoint: url, kind: 'balance', ...parsed };
+    }
+    if (kind === 'zhipu') {
+      const trimmed = trimUrl(baseURL);
+      const url = /\/api\/paas\/v4$/i.test(trimmed)
+        ? `${trimmed}/balance`
+        : `${trimmed}/api/paas/v4/balance`;
+      const response = await fetchJson(url, headers, timeoutMs, signal);
+      const parsed = response.ok ? parseZhipu(response.body) : undefined;
+      if (parsed === undefined) {
+        return { ok: false, error: `HTTP ${response.status}`, endpoint: url, kind: 'balance' };
+      }
+      return { ok: true, endpoint: url, kind: 'balance', ...parsed };
+    }
+    if (kind === 'openrouter') {
+      const trimmed = trimUrl(baseURL);
+      const url = /\/api\/v1$/i.test(trimmed)
+        ? `${trimmed}/credits`
+        : `${trimmed}/api/v1/credits`;
+      const response = await fetchJson(url, headers, timeoutMs, signal);
+      const parsed = response.ok ? parseOpenRouter(response.body) : undefined;
+      if (parsed === undefined) {
+        return { ok: false, error: `HTTP ${response.status}`, endpoint: url, kind: 'balance' };
+      }
+      return { ok: true, endpoint: url, kind: 'balance', ...parsed };
+    }
+    if (kind === 'opencode') {
+      const trimmed = trimUrl(baseURL);
+      const url = /\/v1$/i.test(trimmed)
+        ? `${trimmed}/usage`
+        : `${trimmed}/zen/go/v1/usage`;
+      const response = await fetchJson(url, headers, timeoutMs, signal);
+      const parsed = response.ok ? parseOpencodeUsage(response.body) : undefined;
+      if (parsed === undefined) {
+        return { ok: false, error: `HTTP ${response.status}`, endpoint: url, kind: 'usage' };
+      }
+      return { ok: true, endpoint: url, kind: 'usage', ...parsed };
+    }
+    if (kind === 'newapi') {
+      const origin = originOf(baseURL);
+      const subscriptionUrl = `${origin}/dashboard/billing/subscription`;
+      const subscription = await fetchJson(subscriptionUrl, headers, timeoutMs, signal);
+      const limit = subscription.ok ? parseNewApiLimit(subscription.body) : undefined;
+      if (limit === undefined) {
+        return {
+          ok: false,
+          error: `HTTP ${subscription.status}`,
+          endpoint: subscriptionUrl,
+          kind: 'balance',
+        };
+      }
+      const end = new Date().toISOString().slice(0, 10);
+      const usageUrl = `${origin}/dashboard/billing/usage?start_date=2000-01-01&end_date=${end}`;
+      const usageResponse = await fetchJson(usageUrl, headers, timeoutMs, signal);
+      const used = usageResponse.ok ? parseNewApiUsage(usageResponse.body) : undefined;
+      const remaining = limit - (used ?? 0);
+      return {
+        ok: true,
+        endpoint: subscriptionUrl,
+        kind: 'balance',
+        wallets: [
+          {
+            currency: 'USD',
+            amount: dec(Math.max(0, remaining)),
+            granted: dec(limit),
+            toppedUp: used === undefined ? undefined : dec(used),
+            grantedLabel: 'limit',
+            toppedUpLabel: 'used',
+          },
+        ],
+      };
+    }
+    // Generic supplier: try a few common balance endpoints in order.
+    const candidates = [
+      { url: `${apiRoot(baseURL)}/user/balance`, parse: parseDeepSeek },
+      {
+        url: /\/v1$/i.test(trimUrl(baseURL))
+          ? `${trimUrl(baseURL)}/users/me/balance`
+          : `${trimUrl(baseURL)}/v1/users/me/balance`,
+        parse: parseMoonshot,
+      },
+      {
+        url: /\/api\/v1$/i.test(trimUrl(baseURL))
+          ? `${trimUrl(baseURL)}/credits`
+          : `${trimUrl(baseURL)}/api/v1/credits`,
+        parse: parseOpenRouter,
+      },
+    ];
+    let lastError = 'no supported balance endpoint';
+    for (const candidate of candidates) {
+      const response = await fetchJson(candidate.url, headers, timeoutMs, signal);
+      if (!response.ok) {
+        lastError = `HTTP ${response.status}`;
+        continue;
+      }
+      const parsed = candidate.parse(response.body);
+      if (parsed !== undefined) {
+        return { ok: true, endpoint: candidate.url, kind: 'balance', ...parsed };
+      }
+      const generic = findAmount(response.body);
+      if (generic !== undefined) {
+        return {
+          ok: true,
+          endpoint: candidate.url,
+          kind: 'balance',
+          wallets: [{ currency: generic.currency, amount: dec(generic.amount) }],
+        };
+      }
+      lastError = 'unrecognized balance payload';
+    }
+    return { ok: false, error: lastError, kind: 'balance' };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      kind: kind === 'opencode' ? 'usage' : 'balance',
+    };
+  }
+}
+
+/** Loopback socket check used only when the Host connection service is absent. */
+function isLoopbackRequest(request) {
+  const address = request.socket?.remoteAddress;
+  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false;
+  const host = request.headers.host;
+  if (typeof host !== 'string') return false;
+  let hostUrl;
+  try {
+    hostUrl = new URL(`http://${host}`);
+  } catch {
+    return false;
+  }
+  if (hostUrl.hostname !== '127.0.0.1' && hostUrl.hostname !== 'localhost' && hostUrl.hostname !== '[::1]') {
+    return false;
+  }
+  if (request.headers['sec-fetch-site'] === 'cross-site') return false;
+  const origin = request.headers.origin;
+  if (origin === undefined) return true;
+  try {
+    return new URL(origin).host === hostUrl.host;
+  } catch {
+    return false;
+  }
+}
+
+/** Write one JSON response. */
+function sendJson(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+  });
+  res.end(JSON.stringify(body));
+}
+
+/** Normalize plugin config. */
+function normalizeConfig(config) {
+  const input = config !== null && typeof config === 'object' ? config : {};
+  return {
+    cacheTtlMs:
+      typeof input.cacheTtlMs === 'number' && input.cacheTtlMs >= 5000
+        ? input.cacheTtlMs
+        : DEFAULT_CACHE_TTL_MS,
+    timeoutMs:
+      typeof input.timeoutMs === 'number' && input.timeoutMs >= 1000
+        ? input.timeoutMs
+        : DEFAULT_TIMEOUT_MS,
+    locale: typeof input.locale === 'string' && input.locale !== '' ? input.locale : 'zh',
+    sources: Array.isArray(input.sources) ? input.sources : [],
+    showUnconfigured: input.showUnconfigured === true,
+    autoRefreshAfterSession: input.autoRefreshAfterSession !== false,
+  };
+}
+
+/** The balance panel Host plugin. */
+export function apply(ctx, config) {
+  const settings = normalizeConfig(config);
+  let cache;
+  let cacheAt = 0;
+  let cacheRequestKey = '';
+  let inflight;
+  let inflightKey = '';
+  let buildSeq = 0;
+  let lastRequested;
+  let disposed = false;
+  let sessionTimer;
+  let lastAutoRefreshAt = 0;
+  let sessionUpdate = { at: undefined, autoRefreshedAt: undefined, changes: [] };
+  let sessionRefreshPending = false;
+  let previousAmounts = new Map();
+  const credentialCache = new Map();
+  const modelCache = new Map();
+  let settingsCache = { at: 0, value: undefined };
+
+  /** Read one settings namespace's live value, cached briefly. */
+  const settingsValue = (ns) => {
+    const now = Date.now();
+    if (now - settingsCache.at > 5000) {
+      let entries = [];
+      try {
+        entries = ctx.get('settings')?.describe?.({ redactSecrets: true }) ?? [];
+      } catch {
+        entries = [];
+      }
+      settingsCache = { at: now, value: Array.isArray(entries) ? entries : [] };
+    }
+    const entry = settingsCache.value.find((item) => item?.ns === ns);
+    return entry?.value;
+  };
+
+  /** Read provider profiles declared in the pi-ai settings namespace. */
+  const configuredProviders = () => {
+    const map = new Map();
+    const pi = settingsValue('llm-pi-ai');
+    if (pi !== null && typeof pi === 'object' && pi.providers !== null && typeof pi.providers === 'object') {
+      for (const [id, profile] of Object.entries(pi.providers)) {
+        if (profile !== null && typeof profile === 'object') map.set(id, profile);
+      }
+    }
+    const deepseek = settingsValue('llm-deepseek');
+    if (deepseek !== null && typeof deepseek === 'object' && deepseek.apiKeyEnv !== undefined) {
+      if (!map.has('deepseek-official')) map.set('deepseek-official', deepseek);
+    }
+    return map;
+  };
+
+  /** Describe one credential reference without revealing its value. */
+  const credentialInfo = async (ref) => {
+    if (typeof ref !== 'string' || ref === '') return { configured: false };
+    if (credentialCache.has(ref)) return credentialCache.get(ref);
+    let info = { configured: false };
+    try {
+      const credentials = ctx.get('credentials');
+      if (credentials !== undefined) {
+        const described = await credentials.describe(ref);
+        if (described !== null && typeof described === 'object') info = described;
+      }
+    } catch {
+      info = { configured: false };
+    }
+    if (!info.configured && typeof process !== 'undefined') {
+      const value = process.env[ref];
+      if (typeof value === 'string' && value.trim() !== '') {
+        info = { configured: true, source: 'env' };
+      }
+    }
+    credentialCache.set(ref, info);
+    return info;
+  };
+
+  /** Resolve one credential reference. */
+  const credentialValue = async (ref) => {
+    if (typeof ref !== 'string' || ref === '') return '';
+    try {
+      const credentials = ctx.get('credentials');
+      if (credentials !== undefined) {
+        const hit = await credentials.resolve(ref);
+        if (hit !== null && typeof hit === 'object' && typeof hit.value === 'string' && hit.value !== '') {
+          return hit.value;
+        }
+      }
+    } catch {
+      // Fall through to the process environment.
+    }
+    if (typeof process !== 'undefined' && typeof process.env[ref] === 'string') return process.env[ref];
+    return '';
+  };
+
+  /** Model catalogue with a short cache. */
+  const modelsOf = async (provider) => {
+    if (typeof provider !== 'string' || provider === '') return [];
+    const cached = modelCache.get(provider);
+    if (cached !== undefined) return cached;
+    let models = [];
+    try {
+      const llm = ctx.get('llm');
+      if (llm !== undefined) models = await llm.listModels(provider);
+    } catch {
+      models = [];
+    }
+    if (!Array.isArray(models)) models = [];
+    modelCache.set(provider, models);
+    return models;
+  };
+
+  /** Provider display name from the live LLM registry. */
+  const providerName = (provider) => {
+    try {
+      const llm = ctx.get('llm');
+      const found = llm?.listProviders?.()?.find((item) => item?.id === provider);
+      if (found !== undefined && typeof found.name === 'string') return found.name;
+    } catch {
+      // Ignore.
+    }
+    return provider;
+  };
+
+  /**
+   * Resolve the model the sidebar should describe: the active Session's model
+   * when the browser supplies one, otherwise the configured default.
+   * @param requested - provider/model read from the snapshot query.
+   */
+  const readModel = async (requested) => {
+    let selection;
+    if (requested !== undefined && typeof requested.provider === 'string' && requested.provider !== '') {
+      selection = {
+        provider: requested.provider,
+        model: typeof requested.model === 'string' ? requested.model : '',
+      };
+    } else {
+      try {
+        selection = ctx.get('agentDefaultModel')?.currentSelection?.();
+      } catch {
+        selection = undefined;
+      }
+    }
+    const provider = typeof selection?.provider === 'string' ? selection.provider : '';
+    let id = typeof selection?.model === 'string' ? selection.model : '';
+    const models = await modelsOf(provider);
+    let model = models.find((item) => item?.id === id);
+    if (id === '' && models.length > 0) {
+      id = models[0].id;
+      model = models[0];
+    }
+    return {
+      provider,
+      providerName: provider === '' ? '' : providerName(provider),
+      id,
+      name: typeof model?.name === 'string' && model.name !== '' ? model.name : id,
+      effort: typeof selection?.reasoningEffort === 'string' ? selection.reasoningEffort : undefined,
+    };
+  };
+
+  /** Model rows for one provider, current model first. */
+  const modelsFor = async (provider, current) => {
+    const models = await modelsOf(provider);
+    const rows = [];
+    for (const model of models) {
+      if (typeof model?.id !== 'string') continue;
+      rows.push({ id: model.id, name: typeof model.name === 'string' ? model.name : model.id });
+    }
+    if (current !== undefined && current.id !== '' && !rows.some((row) => row.id === current.id)) {
+      rows.unshift({ id: current.id, name: current.name });
+    }
+    return rows.slice(0, 6);
+  };
+
+  /** The signed-in account as one source. */
+  const readAccount = async () => {
+    const account = ctx.get('deepseekAccount');
+    const base = {
+      id: 'account',
+      kind: 'account',
+      label: 'DeepSeek Account',
+      provider: 'deepseek-account',
+      providers: ['deepseek-account'],
+      providerName: 'DeepSeek',
+      status: 'unavailable',
+      updatedAt: new Date().toISOString(),
+    };
+    if (account === undefined) return base;
+    const client = {
+      version: '1.0.0',
+      locale: settings.locale,
+      timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+    };
+    let state;
+    try {
+      state = await account.getState();
+    } catch (error) {
+      return { ...base, status: 'error', error: error instanceof Error ? error.message : String(error) };
+    }
+    if (state?.status !== 'credential-stored') {
+      return { ...base, status: 'signed-out', links: state?.links };
+    }
+    const [balance, profile] = await Promise.all([
+      account.getBalance(client).catch(() => null),
+      account.getProfile(client).catch(() => null),
+    ]);
+    if (balance === null || balance?.status !== 'ready') {
+      return { ...base, status: 'error', error: 'balance unavailable' };
+    }
+    const profileValue = profile?.status === 'ready' ? profile.value : undefined;
+    const wallets = [];
+    for (const wallet of Array.isArray(balance.value) ? balance.value : []) {
+      const amount = num(wallet?.balance);
+      if (amount === undefined) continue;
+      wallets.push({ currency: currencyOf(wallet.currency, 'CNY'), amount: dec(wallet.balance) });
+    }
+    for (const wallet of Array.isArray(balance.bonusWallets) ? balance.bonusWallets : []) {
+      const amount = num(wallet?.balance);
+      if (amount === undefined || amount === 0) continue;
+      wallets.push({
+        currency: currencyOf(wallet.currency, 'CNY'),
+        amount: dec(wallet.balance),
+        bonus: true,
+      });
+    }
+    return {
+      ...base,
+      status: 'ok',
+      profile: {
+        name: typeof profileValue?.name === 'string' ? profileValue.name : undefined,
+        contact: typeof profileValue?.contact === 'string' ? profileValue.contact : undefined,
+      },
+      wallets,
+      links: state.links,
+    };
+  };
+
+  /** Build the complete snapshot for one refresh. */
+  const buildSnapshot = async (reason, requested) => {
+    const generatedAt = new Date().toISOString();
+    const current = await readModel(requested);
+    const profiles = configuredProviders();
+    const sources = [];
+    const usedProviders = new Set();
+    const usedKeys = new Set();
+
+    // 1. Signed-in account.
+    const account = await readAccount();
+    account.models = current.id === '' ? [] : [{ id: current.id, name: current.name }];
+    sources.push(account);
+
+    // 2. Fixed providers with a credential.
+    for (const adapter of ADAPTERS) {
+      const profile =
+        adapter.providerIds.map((id) => profiles.get(id)).find((item) => item !== undefined) ??
+        (adapter.settingsNs === undefined ? undefined : settingsValue(adapter.settingsNs));
+      const keyRef =
+        (profile !== undefined && typeof profile.apiKeyEnv === 'string' && profile.apiKeyEnv !== ''
+          ? profile.apiKeyEnv
+          : adapter.keyEnv) ?? '';
+      if (keyRef === '') continue;
+      const info = await credentialInfo(keyRef);
+      const altInfo =
+        adapter.altKeyEnv !== undefined ? await credentialInfo(adapter.altKeyEnv) : { configured: false };
+      const configured = info.configured || altInfo.configured;
+      if (!configured && profile === undefined && !settings.showUnconfigured) continue;
+      if (usedKeys.has(keyRef)) continue;
+      usedKeys.add(keyRef);
+      const key = (await credentialValue(keyRef)) || (adapter.altKeyEnv ? await credentialValue(adapter.altKeyEnv) : '');
+      const baseURL =
+        trimUrl(profile?.baseURL) ||
+        trimUrl(process.env[`${adapter.id.toUpperCase().replace(/-/g, '_')}_API_BASE`]) ||
+        adapter.base;
+
+      let result;
+      if (key === '') {
+        result = { ok: false, error: `missing credential ${keyRef}`, kind: adapter.query === 'opencode' ? 'usage' : 'balance' };
+      } else {
+        result = await queryProvider(adapter, {
+          baseURL,
+          apiKey: key,
+          timeoutMs: settings.timeoutMs,
+        });
+      }
+      const model =
+        current.provider !== '' && adapter.providerIds.includes(current.provider)
+          ? { id: current.id, name: current.name }
+          : undefined;
+      const models = await modelsFor(
+        adapter.providerIds.find((id) => id === current.provider) ?? adapter.providerIds[0],
+        model,
+      );
+      sources.push({
+        id: adapter.id,
+        kind: result.ok ? result.kind : adapter.query === 'opencode' ? 'usage' : 'balance',
+        label: providerName(adapter.providerIds[0]) || adapter.id,
+        provider: adapter.providerIds[0],
+        providers: adapter.providerIds,
+        providerName: providerName(adapter.providerIds[0]) || adapter.id,
+        model: model?.id,
+        modelName: model?.name,
+        models: models.length > 0 ? models : model ? [model] : [],
+        status: result.ok ? 'ok' : 'error',
+        error: result.ok ? undefined : result.error,
+        endpoint: result.endpoint,
+        wallets: result.wallets,
+        usage: result.usage,
+        keyRef,
+        baseURL,
+        updatedAt: generatedAt,
+      });
+      for (const id of adapter.providerIds) usedProviders.add(id);
+    }
+
+    // 3. Providers added through Settings → Models (custom APIs).
+    for (const [providerId, profile] of profiles) {
+      if (usedProviders.has(providerId)) continue;
+      if (profile === null || typeof profile !== 'object') continue;
+      const keyRef = typeof profile.apiKeyEnv === 'string' ? profile.apiKeyEnv : '';
+      if (keyRef === '') continue;
+      const info = await credentialInfo(keyRef);
+      if (!info.configured && !settings.showUnconfigured) continue;
+      if (usedKeys.has(keyRef)) continue;
+      usedKeys.add(keyRef);
+      const key = await credentialValue(keyRef);
+      const baseURL = trimUrl(profile.baseURL);
+      const adapter = {
+        id: providerId,
+        query: baseURL === '' ? 'generic' : queryForBase(baseURL, providerId),
+        providerIds: [providerId],
+      };
+      const result =
+        key === '' || baseURL === ''
+          ? {
+              ok: false,
+              error: key === '' ? `missing credential ${keyRef}` : 'this provider declares no baseURL',
+              kind: 'balance',
+            }
+          : await queryProvider(adapter, {
+              baseURL,
+              apiKey: key,
+              timeoutMs: settings.timeoutMs,
+            });
+      const model =
+        current.provider === providerId ? { id: current.id, name: current.name } : undefined;
+      const models = await modelsFor(providerId, model);
+      sources.push({
+        id: `provider:${providerId}`,
+        kind: result.ok ? result.kind : 'balance',
+        label:
+          (typeof profile.displayName === 'string' && profile.displayName !== ''
+            ? profile.displayName
+            : providerName(providerId)) || providerId,
+        provider: providerId,
+        providers: [providerId],
+        providerName: providerName(providerId) || providerId,
+        model: model?.id,
+        modelName: model?.name,
+        models: models.length > 0 ? models : model ? [model] : [],
+        status: result.ok ? 'ok' : 'error',
+        error: result.ok ? undefined : result.error,
+        endpoint: result.endpoint,
+        wallets: result.wallets,
+        usage: result.usage,
+        keyRef,
+        baseURL,
+        updatedAt: generatedAt,
+      });
+      usedProviders.add(providerId);
+    }
+
+    // 4. Explicit sources from the plugin config.
+    for (const [index, source] of settings.sources.entries()) {
+      if (source === null || typeof source !== 'object') continue;
+      const id = typeof source.id === 'string' && source.id !== '' ? source.id : `custom:${index}`;
+      if (sources.some((item) => item.id === id)) continue;
+      const keyRef = typeof source.apiKeyEnv === 'string' ? source.apiKeyEnv : '';
+      const key = keyRef === '' ? '' : await credentialValue(keyRef);
+      const baseURL = trimUrl(source.baseURL);
+      const kind =
+        typeof source.kind === 'string' && source.kind !== ''
+          ? source.kind
+          : baseURL.includes('opencode.ai')
+            ? 'opencode'
+            : 'newapi';
+      let result = { ok: false, error: 'source is not queryable', kind: 'balance' };
+      if (baseURL !== '' && key !== '') {
+        if (typeof source.endpoint === 'string' && source.endpoint !== '') {
+          const url = joinUrl(baseURL, source.endpoint);
+          try {
+            const response = await fetchJson(
+              url,
+              { authorization: `Bearer ${key}` },
+              settings.timeoutMs,
+            );
+            const amount = num(pathGet(response.body, source.amountPath));
+            if (response.ok && amount !== undefined) {
+              result = {
+                ok: true,
+                kind: 'balance',
+                endpoint: url,
+                wallets: [
+                  {
+                    currency: currencyOf(pathGet(response.body, source.currencyPath) ?? source.currency, 'CNY'),
+                    amount: dec(amount),
+                  },
+                ],
+              };
+            } else {
+              result = { ok: false, error: `HTTP ${response.status}`, endpoint: url, kind: 'balance' };
+            }
+          } catch (error) {
+            result = {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+              endpoint: url,
+              kind: 'balance',
+            };
+          }
+        } else {
+          const adapter = {
+            id,
+            query: kind,
+            providerIds: [typeof source.provider === 'string' ? source.provider : id],
+          };
+          result = await queryProvider(adapter, {
+            baseURL,
+            apiKey: key,
+            timeoutMs: settings.timeoutMs,
+          });
+        }
+      }
+      sources.push({
+        id,
+        kind: result.ok ? result.kind : kind === 'opencode' ? 'usage' : 'balance',
+        label: typeof source.label === 'string' && source.label !== '' ? source.label : id,
+        provider: typeof source.provider === 'string' ? source.provider : id,
+        providers: [typeof source.provider === 'string' ? source.provider : id],
+        providerName: typeof source.label === 'string' ? source.label : id,
+        model: typeof source.model === 'string' ? source.model : undefined,
+        modelName: typeof source.modelName === 'string' ? source.modelName : source.model,
+        models: typeof source.model === 'string' ? [{ id: source.model, name: source.modelName ?? source.model }] : [],
+        status: result.ok ? 'ok' : 'error',
+        error: result.ok ? undefined : result.error,
+        endpoint: result.endpoint,
+        wallets: result.wallets,
+        usage: result.usage,
+        keyRef,
+        baseURL,
+        updatedAt: generatedAt,
+      });
+    }
+
+    // 5. Diff the amounts to build the session-update reminder.
+    const nextAmounts = new Map();
+    for (const source of sources) {
+      const wallet = Array.isArray(source.wallets) ? source.wallets[0] : undefined;
+      const value =
+        wallet !== undefined
+          ? num(wallet.amount)
+          : source.usage?.monthly !== undefined
+            ? 100 - num(source.usage.monthly.percent)
+            : undefined;
+      if (value !== undefined) nextAmounts.set(source.id, { value, source });
+    }
+    const changes = [];
+    if (reason === 'session') {
+      for (const [id, next] of nextAmounts) {
+        const previous = previousAmounts.get(id);
+        if (previous === undefined) continue;
+        const delta = next.value - previous.value;
+        if (Math.abs(delta) < 0.0001) continue;
+        const wallet = Array.isArray(next.source.wallets) ? next.source.wallets[0] : undefined;
+        changes.push({
+          sourceId: id,
+          label: next.source.label,
+          model: next.source.model ?? next.source.modelName,
+          currency: wallet?.currency,
+          kind: next.source.kind,
+          before: String(Number(previous.value.toFixed(4))),
+          after: String(Number(next.value.toFixed(4))),
+          delta: String(Number(delta.toFixed(4))),
+        });
+      }
+      previousAmounts = nextAmounts;
+      if (sessionUpdate.at === undefined) sessionUpdate.at = Date.now();
+      sessionUpdate.autoRefreshedAt = Date.now();
+      sessionUpdate.changes = changes.slice(0, MAX_CHANGES);
+    } else if (previousAmounts.size === 0) {
+      previousAmounts = nextAmounts;
+    }
+
+    return {
+      ok: true,
+      generatedAt,
+      account: {
+        status: account.status,
+        name: account.profile?.name,
+        contact: account.profile?.contact,
+      },
+      model: current,
+      sources,
+      sessionUpdate,
+      cacheTtlMs: settings.cacheTtlMs,
+    };
+  };
+
+  /** Read the snapshot, serving the cache unless forced or the requested model changed. */
+  const getSnapshot = async (force, reason, requested) => {
+    const now = Date.now();
+    const requestKey = `${requested?.provider ?? ''}\u0000${requested?.model ?? ''}`;
+    lastRequested = requested;
+    if (
+      !force &&
+      cache !== undefined &&
+      cacheRequestKey === requestKey &&
+      now - cacheAt < settings.cacheTtlMs
+    ) {
+      return cache;
+    }
+    if (!force && inflight !== undefined && inflightKey === requestKey) return inflight;
+    const effectiveReason = force && sessionRefreshPending ? 'session' : reason ?? 'poll';
+    const seq = ++buildSeq;
+    const pending = (async () => {
+      try {
+        const snapshot = await buildSnapshot(effectiveReason, requested);
+        if (seq === buildSeq) {
+          cache = snapshot;
+          cacheAt = Date.now();
+          cacheRequestKey = requestKey;
+        }
+        if (effectiveReason === 'session') sessionRefreshPending = false;
+        return snapshot;
+      } catch (error) {
+        const failed = {
+          ok: false,
+          generatedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error),
+          sources: [],
+          sessionUpdate,
+        };
+        if (seq === buildSeq) {
+          cache = failed;
+          cacheAt = Date.now();
+          cacheRequestKey = requestKey;
+        }
+        return failed;
+      }
+    })();
+    inflight = pending;
+    inflightKey = requestKey;
+    pending.finally(() => {
+      if (inflight === pending) {
+        inflight = undefined;
+        inflightKey = '';
+      }
+    });
+    return pending;
+  };
+
+  /** Note a finished turn and refresh soon, at most once every 10 seconds. */
+  const noteSessionUpdate = () => {
+    if (!settings.autoRefreshAfterSession || disposed) return;
+    sessionUpdate = { ...sessionUpdate, at: Date.now(), changes: [] };
+    sessionRefreshPending = true;
+    if (sessionTimer !== undefined) return;
+    const wait = Math.max(0, 10_000 - (Date.now() - lastAutoRefreshAt));
+    sessionTimer = setTimeout(() => {
+      sessionTimer = undefined;
+      lastAutoRefreshAt = Date.now();
+      cacheAt = 0;
+      void getSnapshot(true, 'session', lastRequested);
+    }, wait + 1200);
+  };
+
+  ctx.effect(() => () => {
+    disposed = true;
+    if (sessionTimer !== undefined) clearTimeout(sessionTimer);
+  }, 'balance-panel: timer');
+
+  ctx.effect(
+    () =>
+      ctx.on('agent/status', (payload) => {
+        if (payload !== null && typeof payload === 'object' && payload.status === 'idle') {
+          noteSessionUpdate();
+        }
+      }),
+    'balance-panel: session update',
+  );
+
+  for (const event of [
+    'credentials/reference-updated',
+    'credentials/record-updated',
+    'settings/document-updated',
+    'deepseek-account/signed-out',
+    'deepseek-account/session-expired',
+    'llm/adapters-updated',
+  ]) {
+    ctx.effect(
+      () =>
+        ctx.on(event, () => {
+          cacheAt = 0;
+          credentialCache.clear();
+          settingsCache = { at: 0, value: undefined };
+          if (event === 'llm/adapters-updated') modelCache.clear();
+        }),
+      `balance-panel: invalidate ${event}`,
+    );
+  }
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: ROUTE,
+        handler: async (req, res) => {
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            sendJson(res, 405, { ok: false, error: 'method not allowed' });
+            return;
+          }
+          // Prefer the Host's own browser-trust fence: it accepts loopback, the
+          // listener bind address, and every configured trusted host (for example
+          // a reverse-proxied GUI domain) while still refusing DNS rebinding.
+          const connection = ctx.get('connection');
+          if (typeof connection?.requestRejection === 'function') {
+            const rejection = connection.requestRejection(req);
+            if (rejection !== undefined) {
+              sendJson(res, rejection, { ok: false, error: 'forbidden' });
+              return;
+            }
+          } else if (!isLoopbackRequest(req)) {
+            sendJson(res, 403, { ok: false, error: 'forbidden' });
+            return;
+          }
+          let force = false;
+          let requested = {};
+          try {
+            const params = new URL(String(req.url), 'http://localhost').searchParams;
+            force = params.get('refresh') === '1';
+            requested = {
+              provider: params.get('provider') || undefined,
+              model: params.get('model') || undefined,
+            };
+          } catch {
+            force = false;
+          }
+          const snapshot = await getSnapshot(force, force ? 'manual' : 'poll', requested);
+          sendJson(res, snapshot.ok === false ? 502 : 200, snapshot);
+        },
+      }),
+    `balance-panel: GET ${ROUTE}`,
+  );
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Balance & Usage",
+    "description": "Shows the active session platform balance with DeepSeek peak/off-peak pricing in the left sidebar, follows model and session switches, and refreshes after session updates."
+  }
+}
