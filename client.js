@@ -12,16 +12,12 @@ window.__ModuleLoader__.load({
     const ROUTE = '/plugins/balance-panel/state';
     /** Client poll interval while the page is visible. */
     const POLL_MS = 15_000;
-    /** localStorage key remembering the last dismissed session reminder. */
-    const ACK_KEY = 'dsh.balance-panel.ack.v1';
 
     const zh = {
       'entry.label': '余额',
       'page.title': '余额',
       'page.refreshTitle': '刷新余额',
       'page.current': '当前',
-      'page.sessionShort': '会话更新后已刷新',
-      'page.ack': '知道了',
       'page.signedOut': '未登录',
       'page.signInHint': '在设置 → 账号登录后查看充值余额和赠金。',
       'page.unavailable': '不可用',
@@ -69,8 +65,6 @@ window.__ModuleLoader__.load({
       'page.title': 'Balance',
       'page.refreshTitle': 'Refresh balances',
       'page.current': 'Current',
-      'page.sessionShort': 'Refreshed after session update',
-      'page.ack': 'Dismiss',
       'page.signedOut': 'Signed out',
       'page.signInHint': 'Sign in from Settings → Account to see topped-up and granted balances.',
       'page.unavailable': 'Unavailable',
@@ -169,48 +163,6 @@ window.__ModuleLoader__.load({
       }
       .dsh-bal-refresh:disabled { opacity: .55; cursor: default; }
       .dsh-bal-refresh:focus-visible {
-        outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary));
-        outline-offset: 1px;
-      }
-      .dsh-bal-notice {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-top: 14px;
-        padding: 7px 8px 7px 10px;
-        border-radius: 8px;
-        background: var(--dsw-alias-bg-layer-1);
-        color: var(--dsw-alias-label-secondary);
-        font-size: 12px;
-        line-height: 18px;
-      }
-      .dsh-bal-notice-dot {
-        width: 6px;
-        height: 6px;
-        flex: none;
-        border-radius: 50%;
-        background: var(--dsw-alias-state-warn-primary);
-      }
-      .dsh-bal-notice-text {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .dsh-bal-dismiss {
-        flex: none;
-        padding: 0 4px;
-        border: 0;
-        border-radius: 4px;
-        background: transparent;
-        color: var(--dsw-alias-label-secondary);
-        cursor: pointer;
-        font-size: 17px;
-        line-height: 19px;
-      }
-      .dsh-bal-dismiss:hover { color: var(--dsw-alias-label-primary); }
-      .dsh-bal-dismiss:focus-visible {
         outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary));
         outline-offset: 1px;
       }
@@ -386,13 +338,6 @@ window.__ModuleLoader__.load({
       error: null,
       refreshing: false,
       pricingPeriod: initialPricing,
-      acknowledgedAt: (() => {
-        try {
-          return Number(window.localStorage.getItem(ACK_KEY) ?? 0) || 0;
-        } catch {
-          return 0;
-        }
-      })(),
     });
 
     let pricingPeriod = initialPricing;
@@ -629,8 +574,6 @@ window.__ModuleLoader__.load({
     /** One small wallet glyph for the sidebar entry. */
     function BalanceIcon({ size = 18 }) {
       const state = useStore();
-      const at = state.snapshot?.sessionUpdate?.at;
-      const unread = typeof at === 'number' && at > state.acknowledgedAt;
       const primary = primarySource(state.snapshot);
       const showPricing = isDeepSeekPriced(primary);
       const pricing = state.pricingPeriod;
@@ -689,16 +632,6 @@ window.__ModuleLoader__.load({
                 fill: 'var(--dsw-alias-state-success-primary)',
                 'aria-hidden': true,
               })
-          : null,
-        unread
-          ? h('circle', {
-              cx: 19.4,
-              cy: 4.6,
-              r: 3.1,
-              fill: 'var(--dsw-alias-state-warn-primary)',
-              stroke: 'var(--dsw-alias-bg-base)',
-              strokeWidth: 1.3,
-            })
           : null,
       );
     }
@@ -861,31 +794,6 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** Compact session-update summary and its hover detail. */
-    function sessionNotice(snapshot) {
-      const changes = Array.isArray(snapshot?.sessionUpdate?.changes)
-        ? snapshot.sessionUpdate.changes
-        : [];
-      const details = changes.map((change) => {
-        const label =
-          change.sourceId === 'account'
-            ? tr('platform.account', 'Account')
-            : platformOf({ id: change.sourceId, provider: change.sourceId, label: change.label });
-        const amount =
-          change.kind === 'usage'
-            ? `${Number(change.before).toFixed(1)}% → ${Number(change.after).toFixed(1)}%`
-            : `${fmtAmount(change.before, change.currency)} → ${fmtAmount(change.after, change.currency)}`;
-        return `${label} ${amount}`;
-      });
-      const summary =
-        details.length === 0
-          ? tr('page.sessionShort', 'Refreshed after session update')
-          : `${tr('page.sessionShort', 'Refreshed after session update')} · ${details[0]}${
-              details.length > 1 ? ` +${details.length - 1}` : ''
-            }`;
-      return { summary, details: details.join('\n') };
-    }
-
     /** The full balance page registered in the `main` slot. */
     function BalancePage() {
       const state = useStore();
@@ -904,25 +812,9 @@ window.__ModuleLoader__.load({
                   : 1;
               return rank(left) - rank(right);
             });
-      const hasUnread =
-        typeof snapshot?.sessionUpdate?.at === 'number' &&
-        snapshot.sessionUpdate.at > state.acknowledgedAt;
-      const notice = hasUnread ? sessionNotice(snapshot) : null;
-
       React.useEffect(() => {
         void load(false);
       }, []);
-
-      const acknowledge = () => {
-        const at = snapshot?.sessionUpdate?.at ?? 0;
-        const next = store.get();
-        store.set({ ...next, acknowledgedAt: at });
-        try {
-          window.localStorage.setItem(ACK_KEY, String(at));
-        } catch {
-          // Storage may be unavailable.
-        }
-      };
 
       const refresh = () => {
         void load(true);
@@ -988,25 +880,6 @@ window.__ModuleLoader__.load({
               ),
             ),
           ),
-          notice === null
-            ? null
-            : h(
-                'div',
-                { className: 'dsh-bal-notice', title: notice.details },
-                h('span', { className: 'dsh-bal-notice-dot', 'aria-hidden': true }),
-                h('span', { className: 'dsh-bal-notice-text' }, notice.summary),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'dsh-bal-dismiss',
-                    onClick: acknowledge,
-                    title: tr('page.ack', 'Dismiss'),
-                    'aria-label': tr('page.ack', 'Dismiss'),
-                  },
-                  '×',
-                ),
-              ),
           state.status === 'loading' && snapshot === null
             ? h('p', { className: 'dsh-bal-empty' }, tr('page.loading', 'Loading…'))
             : null,
