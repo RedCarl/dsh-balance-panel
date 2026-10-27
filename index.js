@@ -766,7 +766,11 @@ export function apply(ctx, config) {
     // 1. Signed-in account.
     const account = await readAccount();
     account.models = current.id === '' ? [] : [{ id: current.id, name: current.name }];
-    sources.push(account);
+    // A signed-out account is not a balance source: do not surface an empty
+    // "Account / Signed out" row in the sidebar or the page.
+    if (account.status !== 'signed-out' && account.status !== 'unavailable') {
+      sources.push(account);
+    }
 
     // 2. Fixed providers with a credential.
     for (const adapter of ADAPTERS) {

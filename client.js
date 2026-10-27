@@ -404,9 +404,17 @@ window.__ModuleLoader__.load({
       return value === key ? source.status : value;
     }
 
+    /** Whether an account source has nothing to show and must stay hidden. */
+    function isHiddenAccount(source) {
+      return (
+        source.kind === 'account' &&
+        (source.status === 'signed-out' || source.status === 'unavailable')
+      );
+    }
+
     /** The source worth showing in the sidebar label and at the top. */
     function primarySource(snapshot) {
-      const sources = snapshot?.sources ?? [];
+      const sources = (snapshot?.sources ?? []).filter((source) => !isHiddenAccount(source));
       const ok = sources.filter((source) => source.status === 'ok');
       const provider = snapshot?.model?.provider;
       const matches = (source) =>
@@ -798,7 +806,9 @@ window.__ModuleLoader__.load({
     function BalancePage() {
       const state = useStore();
       const snapshot = state.snapshot;
-      const sources = Array.isArray(snapshot?.sources) ? snapshot.sources : [];
+      const sources = Array.isArray(snapshot?.sources)
+        ? snapshot.sources.filter((source) => !isHiddenAccount(source))
+        : [];
       const model = snapshot?.model;
       const provider = model?.provider;
       const orderedSources =
