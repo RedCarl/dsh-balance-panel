@@ -1,9 +1,8 @@
 {
   "name": "@local/dsh-balance-panel",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "description": "Multi-source balance and plan usage in the left sidebar, with session-update refresh reminders.",
+  "description": "Multi-source balance and plan usage in the left sidebar, with DeepSeek peak/off-peak pricing and silent session refresh.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -33,5 +32,27 @@
         "@deepseek-ai/dsh-client-locale"
       ]
     }
-  }
+  },
+  "main": "index.js",
+  "author": {
+    "name": "RedCarl"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RedCarl/dsh-balance-panel.git"
+  },
+  "homepage": "https://github.com/RedCarl/dsh-balance-panel",
+  "bugs": {
+    "url": "https://github.com/RedCarl/dsh-balance-panel/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "balance",
+    "usage",
+    "opencode",
+    "deepseek"
+  ]
 }

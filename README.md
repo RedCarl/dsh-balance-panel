@@ -10,6 +10,20 @@
   `/dashboard/billing/subscription` + `/dashboard/billing/usage` 计算余额。
 - **插件配置里的 `sources`**：完全自定义端点、金额 JSON 路径和币种。
 
+## 安装（无需 npm）
+
+直接从 GitHub 安装（推荐）：
+
+```sh
+dsh plugin --profile web add https://github.com/RedCarl/dsh-balance-panel
+```
+
+也可以在 DSH 的「设置 → 插件」中粘贴这个 GitHub 地址；安装后刷新页面。
+
+离线或锁定版本时，从 [GitHub Releases](https://github.com/RedCarl/dsh-balance-panel/releases) 下载 `*.tgz`，在安装框中粘贴本地绝对路径。
+
+> 不需要 npmjs 账号；本插件通过 GitHub 仓库和 GitHub Release 分发。
+
 ## DeepSeek 峰谷提示
 
 当前左侧平台是 DeepSeek（官方 API 或已登录的 DeepSeek 账号）时：
