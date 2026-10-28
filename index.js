@@ -586,7 +586,6 @@ export function apply(ctx, config) {
   let sessionUpdate = { at: undefined, autoRefreshedAt: undefined, changes: [] };
   let sessionRefreshPending = false;
   let previousAmounts = new Map();
-  const credentialCache = new Map();
   const modelCache = new Map();
   let settingsCache = { at: 0, value: undefined };
   let updateCache = {
@@ -628,30 +627,6 @@ export function apply(ctx, config) {
       if (!map.has('deepseek-official')) map.set('deepseek-official', deepseek);
     }
     return map;
-  };
-
-  /** Describe one credential reference without revealing its value. */
-  const credentialInfo = async (ref) => {
-    if (typeof ref !== 'string' || ref === '') return { configured: false };
-    if (credentialCache.has(ref)) return credentialCache.get(ref);
-    let info = { configured: false };
-    try {
-      const credentials = ctx.get('credentials');
-      if (credentials !== undefined) {
-        const described = await credentials.describe(ref);
-        if (described !== null && typeof described === 'object') info = described;
-      }
-    } catch {
-      info = { configured: false };
-    }
-    if (!info.configured && typeof process !== 'undefined') {
-      const value = process.env[ref];
-      if (typeof value === 'string' && value.trim() !== '') {
-        info = { configured: true, source: 'env' };
-      }
-    }
-    credentialCache.set(ref, info);
-    return info;
   };
 
   /** Resolve one credential reference. */
@@ -993,7 +968,12 @@ export function apply(ctx, config) {
       }
       const manager = ctx.get('pluginManager');
       if (manager === undefined) throw new Error('pluginManager is unavailable');
-      const result = await manager.installBundle(GITHUB_URL);
+      // A tagged git spec differs from the recorded dependency, so the plugin
+      // manager does not refuse it as already installed; pnpm updates the
+      // dependency to that release and the manager reloads the bundle.
+      const result = await manager.installBundle(
+        `${GITHUB_URL}#v${check.latestVersion}`,
+      );
       return {
         ok: result.application !== 'failed',
         updated: result.changed !== false && result.application !== 'failed',
@@ -1038,14 +1018,12 @@ export function apply(ctx, config) {
           ? profile.apiKeyEnv
           : adapter.keyEnv) ?? '';
       if (keyRef === '') continue;
-      const info = await credentialInfo(keyRef);
-      const altInfo =
-        adapter.altKeyEnv !== undefined ? await credentialInfo(adapter.altKeyEnv) : { configured: false };
-      const configured = info.configured || altInfo.configured;
-      if (!configured && profile === undefined && !settings.showUnconfigured) continue;
       if (usedKeys.has(keyRef)) continue;
-      usedKeys.add(keyRef);
       const key = (await credentialValue(keyRef)) || (adapter.altKeyEnv ? await credentialValue(adapter.altKeyEnv) : '');
+      // A route without a usable credential is not a balance source: do not
+      // show an empty "Unavailable / missing credential" row.
+      if (key === '' && !settings.showUnconfigured) continue;
+      usedKeys.add(keyRef);
       const baseURL =
         trimUrl(profile?.baseURL) ||
         trimUrl(process.env[`${adapter.id.toUpperCase().replace(/-/g, '_')}_API_BASE`]) ||
@@ -1097,11 +1075,10 @@ export function apply(ctx, config) {
       if (profile === null || typeof profile !== 'object') continue;
       const keyRef = typeof profile.apiKeyEnv === 'string' ? profile.apiKeyEnv : '';
       if (keyRef === '') continue;
-      const info = await credentialInfo(keyRef);
-      if (!info.configured && !settings.showUnconfigured) continue;
       if (usedKeys.has(keyRef)) continue;
-      usedKeys.add(keyRef);
       const key = await credentialValue(keyRef);
+      if (key === '' && !settings.showUnconfigured) continue;
+      usedKeys.add(keyRef);
       const baseURL = trimUrl(profile.baseURL);
       const adapter = {
         id: providerId,
@@ -1155,6 +1132,7 @@ export function apply(ctx, config) {
       if (sources.some((item) => item.id === id)) continue;
       const keyRef = typeof source.apiKeyEnv === 'string' ? source.apiKeyEnv : '';
       const key = keyRef === '' ? '' : await credentialValue(keyRef);
+      if (keyRef !== '' && key === '' && !settings.showUnconfigured) continue;
       const baseURL = trimUrl(source.baseURL);
       const kind =
         typeof source.kind === 'string' && source.kind !== ''
@@ -1380,7 +1358,6 @@ export function apply(ctx, config) {
       () =>
         ctx.on(event, () => {
           cacheAt = 0;
-          credentialCache.clear();
           settingsCache = { at: 0, value: undefined };
           if (event === 'llm/adapters-updated') modelCache.clear();
         }),

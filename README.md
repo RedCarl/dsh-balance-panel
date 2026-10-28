@@ -5,7 +5,7 @@
 
 - **登录账号**：DeepSeek 账号的充值余额与赠金余额（未登录时不显示）。
 - **OpenCode Go 套餐**：5 小时 / 本周 / 本月三档用量与重置时间。
-- **DeepSeek / Moonshot / 智谱 / OpenRouter**：配置了对应环境变量或凭据后自动出现。
+- **DeepSeek / Moonshot / 智谱 / OpenRouter**：配置了对应环境变量或凭据后自动出现；未配置凭据的来源直接省略，不会显示 `missing credential` 行。
 - **设置 → 模型里添加的自定义 API**：带 `baseURL` 的 OpenAI 兼容网关按 New API 的
   `/dashboard/billing/subscription` + `/dashboard/billing/usage` 计算余额。
 - **插件配置里的 `sources`**：完全自定义端点、金额 JSON 路径和币种。
@@ -91,4 +91,5 @@ Host 侧缓存 30 秒；页面隐藏时暂停。切换会话或模型时立即�
 
 - OpenAI / Anthropic / Gemini 等按量后付费服务没有公开的余额端点，只能通过中转网关查询。
 - 账号余额依赖本机已登录的 DeepSeek 账号；未登录时不显示账号条目。
+- 未配置 API key 的来源会直接省略；所有来源都未配置时显示「未发现余额来源」。
 - 自定义 API 必须提供余额端点；没有公开余额接口的服务会显示查询失败原因。

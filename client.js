@@ -492,17 +492,26 @@ window.__ModuleLoader__.load({
       return value === key ? source.status : value;
     }
 
-    /** Whether an account source has nothing to show and must stay hidden. */
-    function isHiddenAccount(source) {
-      return (
+    /** Whether a source has nothing worth showing and must stay hidden. */
+    function isHiddenSource(source) {
+      if (
         source.kind === 'account' &&
         (source.status === 'signed-out' || source.status === 'unavailable')
+      ) {
+        return true;
+      }
+      // Be tolerant of a stale snapshot from an older Host: a source with no
+      // configured credential is not a balance source and should not render.
+      return (
+        source.status === 'error' &&
+        typeof source.error === 'string' &&
+        /^missing credential\b/i.test(source.error)
       );
     }
 
     /** The source worth showing in the sidebar label and at the top. */
     function primarySource(snapshot) {
-      const sources = (snapshot?.sources ?? []).filter((source) => !isHiddenAccount(source));
+      const sources = (snapshot?.sources ?? []).filter((source) => !isHiddenSource(source));
       const ok = sources.filter((source) => source.status === 'ok');
       const provider = snapshot?.model?.provider;
       const matches = (source) =>
@@ -1032,7 +1041,7 @@ window.__ModuleLoader__.load({
       const state = useStore();
       const snapshot = state.snapshot;
       const sources = Array.isArray(snapshot?.sources)
-        ? snapshot.sources.filter((source) => !isHiddenAccount(source))
+        ? snapshot.sources.filter((source) => !isHiddenSource(source))
         : [];
       const model = snapshot?.model;
       const provider = model?.provider;
