@@ -10,6 +10,8 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'balance-panel';
     /** Host snapshot route. */
     const ROUTE = '/plugins/balance-panel/state';
+    /** Host update check/apply route. */
+    const UPDATE_ROUTE = '/plugins/balance-panel/update';
     /** Client poll interval while the page is visible. */
     const POLL_MS = 15_000;
 
@@ -42,6 +44,14 @@ window.__ModuleLoader__.load({
       'page.endpoint': '接口',
       'page.model': '模型',
       'page.localOnly': '余额在本机查询，密钥不会发送到浏览器。',
+      'update.check': '检查更新',
+      'update.action': '更新',
+      'update.updating': '更新中…',
+      'update.upToDate': '已是最新版本',
+      'update.done': '已更新，正在重载…',
+      'update.restart': '已更新，请重启 DSH',
+      'update.failed': '更新失败',
+      'update.interrupted': '更新请求中断，正在刷新确认…',
       'platform.account': '账号',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -89,6 +99,14 @@ window.__ModuleLoader__.load({
       'page.endpoint': 'Endpoint',
       'page.model': 'Model',
       'page.localOnly': 'Balances are queried on this machine; API keys never reach the browser.',
+      'update.check': 'Check for updates',
+      'update.action': 'Update',
+      'update.updating': 'Updating…',
+      'update.upToDate': 'Already up to date',
+      'update.done': 'Updated; reloading…',
+      'update.restart': 'Updated; restart DSH',
+      'update.failed': 'Update failed',
+      'update.interrupted': 'Update request interrupted; reloading to confirm…',
       'platform.account': 'Account',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -144,6 +162,64 @@ window.__ModuleLoader__.load({
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .dsh-bal-titleRow {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        min-width: 0;
+      }
+      .dsh-bal-version {
+        flex: none;
+        padding: 0 2px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--dsw-alias-label-secondary);
+        font: inherit;
+        font-size: 11px;
+        line-height: 16px;
+        cursor: pointer;
+      }
+      .dsh-bal-version:hover {
+        color: var(--dsw-alias-label-primary);
+        background: var(--dsw-alias-bg-layer-2);
+      }
+      .dsh-bal-version:focus-visible {
+        outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary));
+        outline-offset: 1px;
+      }
+      .dsh-bal-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: none;
+      }
+      .dsh-bal-update {
+        height: 24px;
+        padding: 0 10px;
+        border: 0.5px solid var(--dsw-alias-brand-primary);
+        border-radius: 12px;
+        background: transparent;
+        color: var(--dsw-alias-brand-primary);
+        font: inherit;
+        font-size: 11px;
+        line-height: 20px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .dsh-bal-update:hover { background: var(--dsw-alias-bg-layer-2); }
+      .dsh-bal-update:disabled { opacity: .6; cursor: default; }
+      .dsh-bal-update:focus-visible {
+        outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary));
+        outline-offset: 1px;
+      }
+      .dsh-bal-updateline {
+        margin: 8px 0 0;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 11px;
+        line-height: 17px;
+      }
+      .dsh-bal-updateline.error { color: var(--dsw-alias-state-error-primary); }
       .dsh-bal-refresh {
         width: 30px;
         height: 30px;
@@ -338,9 +414,21 @@ window.__ModuleLoader__.load({
       error: null,
       refreshing: false,
       pricingPeriod: initialPricing,
+      update: {
+        status: 'idle',
+        currentVersion: null,
+        latestVersion: null,
+        available: false,
+        releaseUrl: null,
+        error: null,
+        updating: false,
+        message: null,
+        messageError: false,
+      },
     });
 
     let pricingPeriod = initialPricing;
+    let updateGeneration = 0;
     let loadGeneration = 0;
     let loadingCount = 0;
     let lastLoadedAt = 0;
@@ -571,6 +659,143 @@ window.__ModuleLoader__.load({
           const current = store.get();
           if (current.refreshing) store.set({ ...current, refreshing: false });
         }
+      }
+    }
+
+    /** Ask the Host to compare its installed version with the latest release. */
+    async function checkUpdate(force) {
+      const generation = ++updateGeneration;
+      const before = store.get();
+      if (before.update.status !== 'ready' || force) {
+        store.set({
+          ...before,
+          update: { ...before.update, status: 'checking', error: null },
+        });
+      }
+      try {
+        const response = await fetch(`${UPDATE_ROUTE}${force ? '?force=1' : ''}`, {
+          headers: { accept: 'application/json' },
+          cache: 'no-store',
+        });
+        const result = await response.json().catch(() => null);
+        if (generation !== updateGeneration) return;
+        if (result === null || typeof result !== 'object') {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const current = store.get();
+        store.set({
+          ...current,
+          update: {
+            ...current.update,
+            status: 'ready',
+            currentVersion:
+              typeof result.currentVersion === 'string'
+                ? result.currentVersion
+                : current.update.currentVersion,
+            latestVersion:
+              typeof result.latestVersion === 'string' ? result.latestVersion : null,
+            available: result.available === true,
+            releaseUrl:
+              typeof result.releaseUrl === 'string' ? result.releaseUrl : null,
+            error: typeof result.error === 'string' ? result.error : null,
+          },
+        });
+      } catch (error) {
+        if (generation !== updateGeneration) return;
+        const current = store.get();
+        store.set({
+          ...current,
+          update: {
+            ...current.update,
+            status: 'error',
+            available: false,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+    }
+
+    /** Apply the latest GitHub release; the Host reloads its own plugin entry. */
+    async function performUpdate() {
+      const before = store.get();
+      if (before.update.updating) return;
+      store.set({
+        ...before,
+        update: {
+          ...before.update,
+          updating: true,
+          message: null,
+          messageError: false,
+          error: null,
+        },
+      });
+      try {
+        const response = await fetch(UPDATE_ROUTE, {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify({ confirm: true }),
+        });
+        const result = await response.json().catch(() => null);
+        const current = store.get();
+        if (result === null || typeof result !== 'object' || result.ok !== true) {
+          store.set({
+            ...current,
+            update: {
+              ...current.update,
+              updating: false,
+              message: result?.error ?? tr('update.failed', 'Update failed'),
+              messageError: true,
+              error: result?.error ?? `HTTP ${response.status}`,
+            },
+          });
+          return;
+        }
+        if (result.updated === false) {
+          store.set({
+            ...current,
+            update: {
+              ...current.update,
+              updating: false,
+              available: false,
+              message: tr('update.upToDate', 'Already up to date'),
+              messageError: false,
+            },
+          });
+          void checkUpdate(true);
+          return;
+        }
+        const to = typeof result.to === 'string' ? result.to : current.update.latestVersion;
+        const restart = result.application === 'restart-required';
+        store.set({
+          ...current,
+          update: {
+            ...current.update,
+            updating: false,
+            available: false,
+            currentVersion: to ?? current.update.currentVersion,
+            latestVersion: null,
+            message: restart
+              ? tr('update.restart', 'Updated; restart DSH')
+              : tr('update.done', 'Updated; reloading…'),
+            messageError: false,
+          },
+        });
+        if (!restart) {
+          window.setTimeout(() => window.location.reload(), 4000);
+        }
+      } catch (error) {
+        const current = store.get();
+        store.set({
+          ...current,
+          update: {
+            ...current.update,
+            updating: false,
+            message: tr('update.interrupted', 'Update request interrupted; reloading to confirm…'),
+            messageError: true,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+        window.setTimeout(() => window.location.reload(), 5000);
       }
     }
 
@@ -824,6 +1049,9 @@ window.__ModuleLoader__.load({
             });
       React.useEffect(() => {
         void load(false);
+        void checkUpdate(false);
+        const interval = window.setInterval(() => void checkUpdate(false), 30 * 60_000);
+        return () => window.clearInterval(interval);
       }, []);
 
       const refresh = () => {
@@ -834,6 +1062,15 @@ window.__ModuleLoader__.load({
         model !== undefined && model !== null && (model.name || model.id)
           ? model.name || model.id
           : '';
+      const update = state.update;
+      const version =
+        typeof update.currentVersion === 'string'
+          ? update.currentVersion
+          : typeof snapshot?.version === 'string'
+            ? snapshot.version
+            : '';
+      const updateAvailable =
+        update.available === true && typeof update.latestVersion === 'string';
 
       return h(
         'section',
@@ -849,9 +1086,28 @@ window.__ModuleLoader__.load({
               'div',
               { style: { minWidth: 0 } },
               h(
-                'h1',
-                { className: 'dsh-bal-title', title: tr('page.localOnly', 'Local-only balances.') },
-                tr('page.title', 'Balance'),
+                'div',
+                { className: 'dsh-bal-titleRow' },
+                h(
+                  'h1',
+                  { className: 'dsh-bal-title', title: tr('page.localOnly', 'Local-only balances.') },
+                  tr('page.title', 'Balance'),
+                ),
+                version === ''
+                  ? null
+                  : h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-bal-version',
+                        onClick: () => {
+                          void checkUpdate(true);
+                        },
+                        title: tr('update.check', 'Check for updates'),
+                        'aria-label': tr('update.check', 'Check for updates'),
+                      },
+                      `v${version}`,
+                    ),
               ),
               currentText === ''
                 ? null
@@ -862,34 +1118,65 @@ window.__ModuleLoader__.load({
                   ),
             ),
             h(
-              'button',
-              {
-                type: 'button',
-                className: 'dsh-bal-refresh',
-                onClick: refresh,
-                disabled: state.refreshing,
-                title: tr('page.refreshTitle', 'Refresh balances'),
-                'aria-label': tr('page.refreshTitle', 'Refresh balances'),
-              },
+              'div',
+              { className: 'dsh-bal-actions' },
+              updateAvailable
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-bal-update',
+                      onClick: () => {
+                        void performUpdate();
+                      },
+                      disabled: update.updating,
+                      title: `${tr('update.action', 'Update')} v${update.latestVersion}`,
+                    },
+                    update.updating
+                      ? tr('update.updating', 'Updating…')
+                      : `${tr('update.action', 'Update')} v${update.latestVersion}`,
+                  )
+                : null,
               h(
-                'svg',
-                { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
-                h('path', {
-                  d: 'M20 11a8 8 0 1 0-2.34 5.66',
-                  stroke: 'currentColor',
-                  strokeWidth: 1.7,
-                  strokeLinecap: 'round',
-                }),
-                h('path', {
-                  d: 'M20 5v6h-6',
-                  stroke: 'currentColor',
-                  strokeWidth: 1.7,
-                  strokeLinecap: 'round',
-                  strokeLinejoin: 'round',
-                }),
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-bal-refresh',
+                  onClick: refresh,
+                  disabled: state.refreshing,
+                  title: tr('page.refreshTitle', 'Refresh balances'),
+                  'aria-label': tr('page.refreshTitle', 'Refresh balances'),
+                },
+                h(
+                  'svg',
+                  { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+                  h('path', {
+                    d: 'M20 11a8 8 0 1 0-2.34 5.66',
+                    stroke: 'currentColor',
+                    strokeWidth: 1.7,
+                    strokeLinecap: 'round',
+                  }),
+                  h('path', {
+                    d: 'M20 5v6h-6',
+                    stroke: 'currentColor',
+                    strokeWidth: 1.7,
+                    strokeLinecap: 'round',
+                    strokeLinejoin: 'round',
+                  }),
+                ),
               ),
             ),
           ),
+          update.message === null
+            ? null
+            : h(
+                'p',
+                {
+                  className: `dsh-bal-updateline${update.messageError ? ' error' : ''}`,
+                  title: update.error ?? '',
+                },
+                update.message,
+              ),
           state.status === 'loading' && snapshot === null
             ? h('p', { className: 'dsh-bal-empty' }, tr('page.loading', 'Loading…'))
             : null,

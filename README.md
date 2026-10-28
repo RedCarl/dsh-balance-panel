@@ -38,6 +38,16 @@ dsh plugin --profile web add https://github.com/RedCarl/dsh-balance-panel
 
 侧栏入口和页面都跟随**当前会话**的模型：在会话里切换模型后立即重新查询；切换会话时也会重新检查；没有打开会话时回退到默认模型。页面只显示平台、余额/用量和关键变化；模型、密钥引用、接口地址、更新时间等细节放在行的悬停提示里。
 
+## 自动更新
+
+页面标题旁的版本号可以点击检查 GitHub Release。发现新版本时会出现「更新 vX.Y.Z」按钮：
+
+- **git 安装**（当前开发目录）：确认 origin 指向 `RedCarl/dsh-balance-panel`、工作区干净后执行 `git pull --ff-only`，然后自动重载插件；页面几秒后刷新。
+- **GitHub 安装**：通过插件管理器的 `installBundle` 更新。
+- tarball/离线安装不支持自动覆盖，请下载新 tgz 重新安装。
+
+检查结果缓存 30 分钟；点击版本号会强制检查。更新只访问 GitHub Releases API，不会读取或上传任何密钥。
+
 ## 静默刷新
 
 每次会话完成一轮（Host 的 `agent/status` 变为 `idle`）后，插件仍在后台重新查询余额，但不再显示圆点或提醒条；侧栏金额/用量和页面数据会直接更新。需要立即刷新时，用页面右上角的刷新按钮。

@@ -12,11 +12,33 @@
  *
  * When a session finishes a turn (`agent/status` → idle) the snapshot is
  * refreshed shortly afterwards so the left-sidebar entry can show the latest
- * amount and raise its session-update reminder.
+ * amount without a separate notification.
+ *
+ * The plugin also checks its own GitHub releases and can update a git checkout
+ * on demand. Update checks are cached; the update endpoint uses the same browser
+ * trust fence as the read-only snapshot route.
  */
+
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 /** Stable route used by the browser half. */
 export const ROUTE = '/plugins/balance-panel/state';
+
+/** GitHub release endpoint used by the one-click update flow. */
+export const UPDATE_ROUTE = '/plugins/balance-panel/update';
+
+/** Package identity and source repository. */
+const PACKAGE_NAME = '@local/dsh-balance-panel';
+const REPOSITORY = 'RedCarl/dsh-balance-panel';
+const GITHUB_URL = 'https://github.com/RedCarl/dsh-balance-panel';
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
+const execFileAsync = promisify(execFile);
+const UPDATE_CACHE_MS = 30 * 60_000;
 
 /** Services required before the route can mount. */
 export const inject = ['webServer'];
@@ -464,6 +486,36 @@ async function queryProvider(adapter, options) {
   }
 }
 
+/** Numeric semver parts; non-numeric suffixes are ignored. */
+function versionParts(value) {
+  return String(value ?? '')
+    .replace(/^v/i, '')
+    .split(/[.+-]/)
+    .slice(0, 3)
+    .map((part) => Number.parseInt(part, 10) || 0);
+}
+
+/** Whether `latest` is a newer release than `current`. */
+function isNewerVersion(latest, current) {
+  const left = versionParts(latest);
+  const right = versionParts(current);
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] > right[index]) return true;
+    if (left[index] < right[index]) return false;
+  }
+  return false;
+}
+
+/** Read a small JSON request body. */
+async function readRequestBody(req, limit = 8192) {
+  let text = '';
+  for await (const chunk of req) {
+    text += chunk;
+    if (Buffer.byteLength(text) > limit) throw new Error('request body too large');
+  }
+  return text;
+}
+
 /** Loopback socket check used only when the Host connection service is absent. */
 function isLoopbackRequest(request) {
   const address = request.socket?.remoteAddress;
@@ -537,6 +589,14 @@ export function apply(ctx, config) {
   const credentialCache = new Map();
   const modelCache = new Map();
   let settingsCache = { at: 0, value: undefined };
+  let updateCache = {
+    at: 0,
+    latestVersion: undefined,
+    releaseUrl: undefined,
+    publishedAt: undefined,
+    error: undefined,
+  };
+  let updateInFlight = false;
 
   /** Read one settings namespace's live value, cached briefly. */
   const settingsValue = (ns) => {
@@ -754,9 +814,205 @@ export function apply(ctx, config) {
     };
   };
 
+  /** Read this package's version from the installed manifest. */
+  const readLocalVersion = async () => {
+    try {
+      const manifest = JSON.parse(await readFile(join(PLUGIN_DIR, 'package.json'), 'utf8'));
+      return typeof manifest.version === 'string' && manifest.version !== ''
+        ? manifest.version
+        : '0.0.0';
+    } catch {
+      return '0.0.0';
+    }
+  };
+
+  /** Whether this installation is a git checkout. */
+  const installMode = () => (existsSync(join(PLUGIN_DIR, '.git')) ? 'git' : 'bundle');
+
+  /** Run one fixed git command inside the plugin checkout. */
+  const runGit = async (args) =>
+    execFileAsync('git', args, {
+      cwd: PLUGIN_DIR,
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+
+  /** Read the latest GitHub release (or tag when no release exists). */
+  const fetchLatestRelease = async () => {
+    const headers = { 'user-agent': 'dsh-balance-panel' };
+    const response = await fetchJson(
+      `https://api.github.com/repos/${REPOSITORY}/releases/latest`,
+      headers,
+      settings.timeoutMs,
+    );
+    let tag = '';
+    let releaseUrl = '';
+    let publishedAt = '';
+    if (response.ok) {
+      const body = response.body;
+      tag = typeof body?.tag_name === 'string' ? body.tag_name.replace(/^v/i, '') : '';
+      releaseUrl = typeof body?.html_url === 'string' ? body.html_url : '';
+      publishedAt = typeof body?.published_at === 'string' ? body.published_at : '';
+    } else if (response.status === 404) {
+      const tags = await fetchJson(
+        `https://api.github.com/repos/${REPOSITORY}/tags?per_page=1`,
+        headers,
+        settings.timeoutMs,
+      );
+      const first = Array.isArray(tags.body) ? tags.body[0] : undefined;
+      tag = typeof first?.name === 'string' ? first.name.replace(/^v/i, '') : '';
+      releaseUrl = tag === '' ? GITHUB_URL : `${GITHUB_URL}/releases/tag/v${tag}`;
+    } else {
+      throw new Error(`GitHub HTTP ${response.status}`);
+    }
+    if (tag === '') throw new Error('GitHub release has no version tag');
+    return { version: tag, releaseUrl: releaseUrl || GITHUB_URL, publishedAt };
+  };
+
+  /** Check GitHub, caching the latest release for a short while. */
+  const checkUpdate = async (force) => {
+    const currentVersion = await readLocalVersion();
+    const now = Date.now();
+    if (force || updateCache.at === 0 || now - updateCache.at > UPDATE_CACHE_MS) {
+      try {
+        const release = await fetchLatestRelease();
+        updateCache = {
+          at: now,
+          latestVersion: release.version,
+          releaseUrl: release.releaseUrl,
+          publishedAt: release.publishedAt,
+          error: undefined,
+        };
+      } catch (error) {
+        updateCache = {
+          at: now,
+          latestVersion: undefined,
+          releaseUrl: undefined,
+          publishedAt: undefined,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+    const latestVersion = updateCache.latestVersion;
+    return {
+      ok: updateCache.error === undefined,
+      currentVersion,
+      latestVersion,
+      available:
+        typeof latestVersion === 'string' && isNewerVersion(latestVersion, currentVersion),
+      releaseUrl: updateCache.releaseUrl,
+      publishedAt: updateCache.publishedAt,
+      mode: installMode(),
+      checkedAt: new Date(updateCache.at).toISOString(),
+      error: updateCache.error,
+    };
+  };
+
+  /**
+   * Reload this plugin entry after a git checkout changed on disk. The current
+   * request has already been answered; disabling and re-enabling the entry lets
+   * the Loader import the new Host code.
+   */
+  const scheduleSelfReload = () => {
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const manager = ctx.get('pluginManager');
+          if (manager === undefined) return;
+          const entries = await manager.listPlugins();
+          const entry = entries.find(
+            (candidate) =>
+              candidate.moduleName === PACKAGE_NAME && candidate.enabled !== false,
+          );
+          if (entry === undefined) return;
+          try {
+            await manager.setPluginEnabled(entry.entryId, false);
+          } catch {
+            // Keep going: a failed disable may still be enabled.
+          }
+          try {
+            await manager.setPluginEnabled(entry.entryId, true);
+          } catch {
+            // The next page load reports the installed version.
+          }
+        } catch {
+          // Best-effort reload; the client still reloads its bundle.
+        }
+      })();
+    }, 1200);
+  };
+
+  /** Apply the latest release to the current installation. */
+  const performUpdate = async () => {
+    if (updateInFlight) throw new Error('an update is already running');
+    updateInFlight = true;
+    try {
+      const check = await checkUpdate(true);
+      if (!check.available) {
+        return {
+          ok: true,
+          updated: false,
+          from: check.currentVersion,
+          to: check.latestVersion,
+          mode: check.mode,
+          message: 'already up to date',
+        };
+      }
+      if (check.mode === 'git') {
+        const origin = (await runGit(['remote', 'get-url', 'origin'])).stdout.trim();
+        if (!origin.includes(REPOSITORY)) {
+          throw new Error(`origin is not ${REPOSITORY}`);
+        }
+        const dirty = (await runGit(['status', '--porcelain'])).stdout.trim();
+        if (dirty !== '') {
+          throw new Error('the checkout has local changes; commit or stash them first');
+        }
+        await runGit(['pull', '--ff-only']);
+        const to = await readLocalVersion();
+        if (!isNewerVersion(to, check.currentVersion)) {
+          return {
+            ok: true,
+            updated: false,
+            from: check.currentVersion,
+            to,
+            mode: 'git',
+            message: 'already up to date',
+          };
+        }
+        scheduleSelfReload();
+        return {
+          ok: true,
+          updated: true,
+          from: check.currentVersion,
+          to,
+          mode: 'git',
+          reload: true,
+          latestVersion: check.latestVersion,
+        };
+      }
+      const manager = ctx.get('pluginManager');
+      if (manager === undefined) throw new Error('pluginManager is unavailable');
+      const result = await manager.installBundle(GITHUB_URL);
+      return {
+        ok: result.application !== 'failed',
+        updated: result.changed !== false && result.application !== 'failed',
+        from: check.currentVersion,
+        to: check.latestVersion,
+        mode: 'bundle',
+        application: result.application,
+        restartReason: result.restartReason,
+        warnings: result.warnings,
+      };
+    } finally {
+      updateInFlight = false;
+    }
+  };
+
   /** Build the complete snapshot for one refresh. */
   const buildSnapshot = async (reason, requested) => {
     const generatedAt = new Date().toISOString();
+    const version = await readLocalVersion();
     const current = await readModel(requested);
     const profiles = configuredProviders();
     const sources = [];
@@ -1016,6 +1272,7 @@ export function apply(ctx, config) {
     return {
       ok: true,
       generatedAt,
+      version,
       account: {
         status: account.status,
         name: account.profile?.name,
@@ -1131,6 +1388,24 @@ export function apply(ctx, config) {
     );
   }
 
+  /** Apply the Host browser-trust fence to one route. */
+  const rejectRequest = (req, res) => {
+    const connection = ctx.get('connection');
+    if (typeof connection?.requestRejection === 'function') {
+      const rejection = connection.requestRejection(req);
+      if (rejection !== undefined) {
+        sendJson(res, rejection, { ok: false, error: 'forbidden' });
+        return true;
+      }
+      return false;
+    }
+    if (!isLoopbackRequest(req)) {
+      sendJson(res, 403, { ok: false, error: 'forbidden' });
+      return true;
+    }
+    return false;
+  };
+
   ctx.effect(
     () =>
       ctx.webServer.register({
@@ -1141,20 +1416,7 @@ export function apply(ctx, config) {
             sendJson(res, 405, { ok: false, error: 'method not allowed' });
             return;
           }
-          // Prefer the Host's own browser-trust fence: it accepts loopback, the
-          // listener bind address, and every configured trusted host (for example
-          // a reverse-proxied GUI domain) while still refusing DNS rebinding.
-          const connection = ctx.get('connection');
-          if (typeof connection?.requestRejection === 'function') {
-            const rejection = connection.requestRejection(req);
-            if (rejection !== undefined) {
-              sendJson(res, rejection, { ok: false, error: 'forbidden' });
-              return;
-            }
-          } else if (!isLoopbackRequest(req)) {
-            sendJson(res, 403, { ok: false, error: 'forbidden' });
-            return;
-          }
+          if (rejectRequest(req, res)) return;
           let force = false;
           let requested = {};
           try {
@@ -1172,5 +1434,77 @@ export function apply(ctx, config) {
         },
       }),
     `balance-panel: GET ${ROUTE}`,
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: UPDATE_ROUTE,
+        handler: async (req, res) => {
+          if (rejectRequest(req, res)) return;
+
+          if (req.method === 'GET' || req.method === 'HEAD') {
+            let force = false;
+            try {
+              force = new URL(String(req.url), 'http://localhost').searchParams.get('force') === '1';
+            } catch {
+              force = false;
+            }
+            try {
+              const state = await checkUpdate(force);
+              sendJson(res, 200, state);
+            } catch (error) {
+              sendJson(res, 500, {
+                ok: false,
+                currentVersion: await readLocalVersion(),
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            return;
+          }
+
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { ok: false, error: 'method not allowed' });
+            return;
+          }
+
+          const contentType = String(req.headers['content-type'] ?? '')
+            .split(';', 1)[0]
+            .trim()
+            .toLowerCase();
+          if (contentType !== 'application/json') {
+            sendJson(res, 415, { ok: false, error: 'content-type must be application/json' });
+            return;
+          }
+
+          let payload;
+          try {
+            const text = await readRequestBody(req);
+            payload = text === '' ? {} : JSON.parse(text);
+          } catch (error) {
+            sendJson(res, 400, {
+              ok: false,
+              error: error instanceof Error ? error.message : 'invalid request body',
+            });
+            return;
+          }
+          if (payload === null || typeof payload !== 'object' || payload.confirm !== true) {
+            sendJson(res, 400, { ok: false, error: 'confirm: true is required' });
+            return;
+          }
+
+          try {
+            const result = await performUpdate();
+            sendJson(res, result.ok === false ? 409 : 200, result);
+          } catch (error) {
+            sendJson(res, 500, {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        },
+      }),
+    `balance-panel: GET/POST ${UPDATE_ROUTE}`,
   );
 }
