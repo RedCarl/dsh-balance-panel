@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-balance-panel",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "type": "module",
   "description": "Multi-source balance and plan usage in the left sidebar, with DeepSeek peak/off-peak pricing and silent session refresh.",
   "exports": {

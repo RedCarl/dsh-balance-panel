@@ -40,6 +40,12 @@ const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
 const UPDATE_CACHE_MS = 30 * 60_000;
 
+/** Public status endpoints used by the service-health section. */
+const OPENCODE_STATUS_URL = 'https://status.opencode.ai/api/status';
+const DEEPSEEK_STATUS_URL = 'https://status.deepseek.com/';
+const STATUS_CACHE_MS = 60_000;
+const STATUS_TIMEOUT_MS = 6_000;
+
 /** Services required before the route can mount. */
 export const inject = ['webServer'];
 
@@ -516,6 +522,134 @@ async function readRequestBody(req, limit = 8192) {
   return text;
 }
 
+/** Decode the React Server Component stream embedded in a Next.js status page. */
+function decodeNextStream(html) {
+  const pattern = /self\.__next_f\.push\(\[1,("(?:\\.|[^"\\])*")\]\)/g;
+  let match;
+  let text = '';
+  while ((match = pattern.exec(html)) !== null) {
+    try {
+      text += JSON.parse(match[1]);
+    } catch {
+      // Ignore a malformed segment and keep the rest.
+    }
+  }
+  return text;
+}
+
+/** Read one balanced JSON object that starts after a marker. */
+function readJsonObjectAfter(text, marker) {
+  let from = 0;
+  while (from < text.length) {
+    const at = text.indexOf(marker, from);
+    if (at < 0) break;
+    const start = text.indexOf('{', at + marker.length);
+    if (start < 0) break;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const ch = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          return { value: JSON.parse(text.slice(start, index + 1)), end: index };
+        }
+      }
+    }
+    from = at + marker.length;
+  }
+  return undefined;
+}
+
+/** Severity order used to combine component statuses. */
+const STATUS_RANK = {
+  operational: 0,
+  maintenance: 1,
+  degraded: 2,
+  partial_outage: 3,
+  full_outage: 4,
+  outage: 4,
+};
+
+/** The most severe status in a list. */
+function worstStatus(statuses) {
+  let worst = 'operational';
+  for (const status of statuses) {
+    if ((STATUS_RANK[status] ?? 2) > (STATUS_RANK[worst] ?? 0)) worst = status;
+  }
+  return worst;
+}
+
+/** Short component name for a DeepSeek API component. */
+function deepseekShortName(name) {
+  return String(name ?? '')
+    .replace(/^DeepSeek\s+/i, '')
+    .replace(/\s*API服务\(API Service\)/i, ' API')
+    .replace(/\s*服务\(API Service\)/i, ' API')
+    .trim();
+}
+
+/** Parse the status page's server-rendered component data. */
+function parseDeepSeekStatusHtml(html) {
+  const stream = decodeNextStream(html);
+  if (stream === '') throw new Error('DeepSeek status data is missing');
+  let data;
+  let from = 0;
+  while (data === undefined) {
+    const at = stream.indexOf('"initialData":', from);
+    if (at < 0) break;
+    const found = readJsonObjectAfter(stream, '"initialData":');
+    if (found !== undefined && found.value?.page?.components !== undefined) {
+      data = found.value;
+      break;
+    }
+    from = at + 1;
+  }
+  if (data === undefined) throw new Error('DeepSeek status data is missing');
+  const components = (Array.isArray(data.page.components) ? data.page.components : [])
+    .filter((component) => component !== null && typeof component === 'object')
+    .map((component) => ({
+      id: typeof component.component_id === 'string' ? component.component_id : '',
+      name: typeof component.name === 'string' ? component.name : '',
+      status: 'operational',
+    }));
+  const byId = new Map(components.map((component) => [component.id, component]));
+  const activeChanges = Array.isArray(data.active_changes) ? data.active_changes : [];
+  for (const change of activeChanges) {
+    const affected = Array.isArray(change?.affected_components) ? change.affected_components : [];
+    for (const item of affected) {
+      const component =
+        byId.get(item?.component_id) ??
+        components.find((candidate) => candidate.name === item?.name);
+      if (component !== undefined && typeof item?.status === 'string') {
+        component.status = item.status;
+      }
+    }
+  }
+  const updated = /"initialDataUpdatedAt":(\d+)/.exec(stream);
+  return {
+    ok: true,
+    components,
+    incidents: activeChanges.map((change) => ({
+      title: typeof change?.title === 'string' ? change.title : '',
+      status: typeof change?.status === 'string' ? change.status : '',
+    })),
+    updatedAt: updated === null ? Date.now() : Number(updated[1]),
+  };
+}
+
 /** Loopback socket check used only when the Host connection service is absent. */
 function isLoopbackRequest(request) {
   const address = request.socket?.remoteAddress;
@@ -596,6 +730,8 @@ export function apply(ctx, config) {
     error: undefined,
   };
   let updateInFlight = false;
+  let opencodeStatusCache = { at: 0, value: undefined };
+  let deepseekStatusCache = { at: 0, value: undefined };
 
   /** Read one settings namespace's live value, cached briefly. */
   const settingsValue = (ns) => {
@@ -989,6 +1125,152 @@ export function apply(ctx, config) {
     }
   };
 
+  /** Fetch text with the same timeout discipline as JSON calls. */
+  const fetchText = async (url, headers, timeoutMs) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        headers: { accept: 'text/html', ...headers },
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      return { ok: response.ok, status: response.status, text };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  /** Cached OpenCode status payload. */
+  const loadOpenCodeStatus = async () => {
+    if (Date.now() - opencodeStatusCache.at < STATUS_CACHE_MS) return opencodeStatusCache.value;
+    try {
+      const response = await fetchJson(
+        OPENCODE_STATUS_URL,
+        { 'user-agent': 'dsh-balance-panel' },
+        Math.min(settings.timeoutMs, STATUS_TIMEOUT_MS),
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!Array.isArray(response.body?.components)) {
+        throw new Error('OpenCode status payload has no components');
+      }
+      opencodeStatusCache = { at: Date.now(), value: response.body };
+    } catch (error) {
+      opencodeStatusCache = {
+        at: Date.now(),
+        value: { ok: false, error: error instanceof Error ? error.message : String(error) },
+      };
+    }
+    return opencodeStatusCache.value;
+  };
+
+  /** Cached DeepSeek status page data. */
+  const loadDeepSeekStatus = async () => {
+    if (Date.now() - deepseekStatusCache.at < STATUS_CACHE_MS) return deepseekStatusCache.value;
+    try {
+      const response = await fetchText(
+        DEEPSEEK_STATUS_URL,
+        { 'user-agent': 'dsh-balance-panel' },
+        Math.min(settings.timeoutMs, STATUS_TIMEOUT_MS),
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      deepseekStatusCache = { at: Date.now(), value: parseDeepSeekStatusHtml(response.text) };
+    } catch (error) {
+      deepseekStatusCache = {
+        at: Date.now(),
+        value: { ok: false, error: error instanceof Error ? error.message : String(error) },
+      };
+    }
+    return deepseekStatusCache.value;
+  };
+
+  /** Pick the OpenCode Go status and speed for the active model. */
+  const buildOpenCodeStatus = (raw, current) => {
+    if (raw === undefined || raw?.ok === false) {
+      return { ok: false, error: raw?.error ?? 'OpenCode status unavailable' };
+    }
+    const go = (Array.isArray(raw.components) ? raw.components : []).find(
+      (component) => component?.service === 'go',
+    );
+    if (go === undefined) return { ok: false, error: 'OpenCode Go status is missing' };
+    const model = (Array.isArray(go.breakdown) ? go.breakdown : []).find(
+      (item) => item?.id === current.id,
+    );
+    const speed =
+      model?.speed !== undefined &&
+      ((Number.isFinite(model.speed.ttft) && model.speed.ttft > 0) ||
+        (Number.isFinite(model.speed.tps) && model.speed.tps > 0))
+        ? model.speed
+        : go.speed;
+    return {
+      ok: true,
+      status: typeof model?.status === 'string' ? model.status : go.status,
+      reason: typeof model?.reason === 'string' ? model.reason : go.reason,
+      speed,
+      model:
+        model === undefined
+          ? undefined
+          : { id: model.id, status: model.status, reason: model.reason, speed: model.speed },
+      models: go.models,
+      updatedAt: raw.updatedAt,
+      source: 'https://status.opencode.ai/',
+    };
+  };
+
+  /** Pick the official DeepSeek component status for the active model. */
+  const buildDeepSeekStatus = (raw, current) => {
+    if (raw === undefined || raw?.ok === false) {
+      return { ok: false, error: raw?.error ?? 'DeepSeek status unavailable' };
+    }
+    const components = Array.isArray(raw.components) ? raw.components : [];
+    const overall = worstStatus(components.map((component) => component.status));
+    const text = `${current.id ?? ''} ${current.name ?? ''}`.toLowerCase();
+    const want = /pro|reasoner/.test(text) ? 'pro' : /flash|chat/.test(text) ? 'flash' : '';
+    const component =
+      want === ''
+        ? undefined
+        : components.find(
+            (candidate) =>
+              candidate.name.toLowerCase().includes(want) &&
+              candidate.name.toLowerCase().includes('api'),
+          );
+    return {
+      ok: true,
+      status: component?.status ?? overall,
+      overall,
+      component:
+        component === undefined
+          ? undefined
+          : {
+              id: component.id,
+              name: component.name,
+              label: deepseekShortName(component.name),
+              status: component.status,
+            },
+      components,
+      incidents: raw.incidents,
+      updatedAt: raw.updatedAt,
+      source: 'https://status.deepseek.com/',
+    };
+  };
+
+  /** Build the service-status section only for providers with a visible source. */
+  const buildStatuses = async (current, sources) => {
+    const wantsOpenCode = sources.some((source) => source.id === 'opencode-go');
+    const wantsDeepSeek = sources.some(
+      (source) => source.id === 'deepseek' || source.id === 'account',
+    );
+    if (!wantsOpenCode && !wantsDeepSeek) return {};
+    const [opencode, deepseek] = await Promise.all([
+      wantsOpenCode ? loadOpenCodeStatus() : undefined,
+      wantsDeepSeek ? loadDeepSeekStatus() : undefined,
+    ]);
+    const status = {};
+    if (wantsOpenCode) status.opencode = buildOpenCodeStatus(opencode, current);
+    if (wantsDeepSeek) status.deepseek = buildDeepSeekStatus(deepseek, current);
+    return status;
+  };
+
   /** Build the complete snapshot for one refresh. */
   const buildSnapshot = async (reason, requested) => {
     const generatedAt = new Date().toISOString();
@@ -1208,6 +1490,8 @@ export function apply(ctx, config) {
       });
     }
 
+    const status = await buildStatuses(current, sources);
+
     // 5. Diff the amounts to build the session-update reminder.
     const nextAmounts = new Map();
     for (const source of sources) {
@@ -1258,6 +1542,7 @@ export function apply(ctx, config) {
       },
       model: current,
       sources,
+      status,
       sessionUpdate,
       cacheTtlMs: settings.cacheTtlMs,
     };

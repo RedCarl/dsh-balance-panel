@@ -9,6 +9,7 @@
 - **设置 → 模型里添加的自定义 API**：带 `baseURL` 的 OpenAI 兼容网关按 New API 的
   `/dashboard/billing/subscription` + `/dashboard/billing/usage` 计算余额。
 - **插件配置里的 `sources`**：完全自定义端点、金额 JSON 路径和币种。
+- **服务状态**：配置了 OpenCode / DeepSeek 来源时，页面底部显示 OpenCode Go 的当前状态与速度（首字延迟、tok/s），以及 DeepSeek 官方状态页中当前模型对应的 API 组件状态。
 
 ## 安装（无需 npm）
 
@@ -37,6 +38,15 @@ dsh plugin --profile web add https://github.com/RedCarl/dsh-balance-panel
 ## 跟随会话
 
 侧栏入口和页面都跟随**当前会话**的模型：在会话里切换模型后立即重新查询；切换会话时也会重新检查；没有打开会话时回退到默认模型。页面只显示平台、余额/用量和关键变化；模型、密钥引用、接口地址、更新时间等细节放在行的悬停提示里。
+
+## 服务状态
+
+页面底部的「服务状态」只在对应来源存在时出现：
+
+- **OpenCode Go**：读取 [status.opencode.ai](https://status.opencode.ai/) 的公开 JSON API，显示 Go 的当前状态，以及当前模型最近 5 分钟的首字延迟和输出速度；悬停可看具体模型、原因和更新时间。
+- **DeepSeek**：读取 [status.deepseek.com](https://status.deepseek.com/) 官方状态页，按当前模型匹配 V4.1 Flash / V4 Pro API 组件，显示组件状态；悬停可看整体状态、事件和更新时间。
+
+状态结果缓存 60 秒；状态页不可达时显示「未知」，不影响余额查询。
 
 ## 自动更新
 

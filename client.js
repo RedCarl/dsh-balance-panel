@@ -52,6 +52,22 @@ window.__ModuleLoader__.load({
       'update.restart': '已更新，请重启 DSH',
       'update.failed': '更新失败',
       'update.interrupted': '更新请求中断，正在刷新确认…',
+      'health.title': '服务状态',
+      'health.opencode': 'OpenCode Go',
+      'health.deepseek': 'DeepSeek',
+      'health.operational': '正常',
+      'health.degraded': '性能下降',
+      'health.partial_outage': '部分故障',
+      'health.full_outage': '故障',
+      'health.outage': '故障',
+      'health.maintenance': '维护中',
+      'health.unknown': '未知',
+      'health.updated': '更新于',
+      'health.ttft': '首字',
+      'health.official': '官方状态',
+      'health.overall': '整体',
+      'health.reason.upstream': '上游问题',
+      'health.reason.latency': '延迟',
       'platform.account': '账号',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -107,6 +123,22 @@ window.__ModuleLoader__.load({
       'update.restart': 'Updated; restart DSH',
       'update.failed': 'Update failed',
       'update.interrupted': 'Update request interrupted; reloading to confirm…',
+      'health.title': 'Service status',
+      'health.opencode': 'OpenCode Go',
+      'health.deepseek': 'DeepSeek',
+      'health.operational': 'Operational',
+      'health.degraded': 'Degraded',
+      'health.partial_outage': 'Partial outage',
+      'health.full_outage': 'Outage',
+      'health.outage': 'Outage',
+      'health.maintenance': 'Maintenance',
+      'health.unknown': 'Unknown',
+      'health.updated': 'Updated',
+      'health.ttft': 'TTFT',
+      'health.official': 'Official status',
+      'health.overall': 'Overall',
+      'health.reason.upstream': 'Upstream',
+      'health.reason.latency': 'Latency',
       'platform.account': 'Account',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -220,6 +252,51 @@ window.__ModuleLoader__.load({
         line-height: 17px;
       }
       .dsh-bal-updateline.error { color: var(--dsw-alias-state-error-primary); }
+      .dsh-bal-health {
+        margin-top: 24px;
+        padding-top: 16px;
+        border-top: 0.5px solid var(--dsw-alias-border-l1);
+      }
+      .dsh-bal-health-title {
+        margin: 0;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 18px;
+      }
+      .dsh-bal-health-list {
+        list-style: none;
+        margin: 8px 0 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+      .dsh-bal-health-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+        font-size: 12px;
+        line-height: 18px;
+      }
+      .dsh-bal-health-name {
+        flex: none;
+        color: var(--dsw-alias-label-primary);
+      }
+      .dsh-bal-health-label { flex: none; }
+      .dsh-bal-health-label.ok { color: var(--dsw-alias-state-success-primary); }
+      .dsh-bal-health-label.warn { color: var(--dsw-alias-state-warn-primary); }
+      .dsh-bal-health-label.error { color: var(--dsw-alias-state-error-primary); }
+      .dsh-bal-health-label.muted { color: var(--dsw-alias-label-secondary); }
+      .dsh-bal-health-detail {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--dsw-alias-label-secondary);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
       .dsh-bal-refresh {
         width: 30px;
         height: 30px;
@@ -278,6 +355,7 @@ window.__ModuleLoader__.load({
       }
       .dsh-bal-dot.warn { background: var(--dsw-alias-state-warn-primary); }
       .dsh-bal-dot.error { background: var(--dsw-alias-state-error-primary); }
+      .dsh-bal-dot.muted { background: var(--dsw-alias-label-secondary); }
       .dsh-bal-value {
         text-align: right;
         font-size: 15px;
@@ -1036,6 +1114,97 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** Health tone shared by the dot and the label. */
+    function healthTone(code) {
+      if (code === 'operational') return 'ok';
+      if (code === 'degraded' || code === 'maintenance') return 'warn';
+      if (code === 'partial_outage' || code === 'full_outage' || code === 'outage') return 'error';
+      return 'muted';
+    }
+
+    /** Localized service status label. */
+    function healthLabel(code) {
+      const labels = {
+        operational: tr('health.operational', 'Operational'),
+        degraded: tr('health.degraded', 'Degraded'),
+        partial_outage: tr('health.partial_outage', 'Partial outage'),
+        full_outage: tr('health.full_outage', 'Outage'),
+        outage: tr('health.outage', 'Outage'),
+        maintenance: tr('health.maintenance', 'Maintenance'),
+        unknown: tr('health.unknown', 'Unknown'),
+      };
+      return labels[code] ?? tr('health.unknown', 'Unknown');
+    }
+
+    /** Compact TTFT / tokens-per-second copy. */
+    function healthSpeed(speed) {
+      if (speed === null || typeof speed !== 'object') return '';
+      const parts = [];
+      if (Number.isFinite(speed.ttft) && speed.ttft > 0) {
+        parts.push(`${tr('health.ttft', 'TTFT')} ${(speed.ttft / 1000).toFixed(1)}s`);
+      }
+      if (Number.isFinite(speed.tps) && speed.tps > 0) {
+        parts.push(`${Math.round(speed.tps)} tok/s`);
+      }
+      return parts.join(' · ');
+    }
+
+    /** Browser-local HH:MM for a status timestamp. */
+    function healthTime(updatedAt) {
+      const date = new Date(Number(updatedAt));
+      if (!Number.isFinite(date.getTime())) return '';
+      return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    }
+
+    /** Hover detail for one service-health row. */
+    function healthTitle(kind, row) {
+      const code = row.ok === false ? 'unknown' : row.status;
+      const bits = [
+        kind === 'opencode' ? tr('health.opencode', 'OpenCode Go') : tr('health.deepseek', 'DeepSeek'),
+        healthLabel(code),
+      ];
+      if (kind === 'opencode') {
+        if (row.model?.id) bits.push(row.model.id);
+        if (typeof row.reason === 'string' && row.reason !== '' && row.reason !== 'none') {
+          bits.push(tr(`health.reason.${row.reason}`, row.reason));
+        }
+        const speed = healthSpeed(row.speed);
+        if (speed !== '') bits.push(speed);
+      } else {
+        if (row.component?.name) bits.push(row.component.name);
+        if (row.overall !== undefined && row.overall !== row.status) {
+          bits.push(`${tr('health.overall', 'Overall')}: ${healthLabel(row.overall)}`);
+        }
+        if (Array.isArray(row.incidents) && row.incidents.length > 0) {
+          const titles = row.incidents.map((incident) => incident?.title).filter(Boolean);
+          if (titles.length > 0) bits.push(titles.join(' / '));
+        }
+      }
+      const time = healthTime(row.updatedAt);
+      if (time !== '') bits.push(`${tr('health.updated', 'Updated')} ${time}`);
+      if (typeof row.error === 'string' && row.error !== '') bits.push(row.error);
+      return bits.join(' · ');
+    }
+
+    /** One compact service-health row. */
+    function HealthRow({ kind, row }) {
+      const code = row.ok === false ? 'unknown' : row.status;
+      const tone = healthTone(code);
+      const name = kind === 'opencode' ? tr('health.opencode', 'OpenCode Go') : tr('health.deepseek', 'DeepSeek');
+      const detail =
+        kind === 'opencode'
+          ? healthSpeed(row.speed) || (row.model?.id ?? '')
+          : row.component?.label ?? tr('health.official', 'Official status');
+      return h(
+        'li',
+        { className: 'dsh-bal-health-row', title: healthTitle(kind, row) },
+        h('span', { className: `dsh-bal-dot ${tone}`, 'aria-hidden': true }),
+        h('span', { className: 'dsh-bal-health-name' }, name),
+        h('span', { className: `dsh-bal-health-label ${tone}` }, healthLabel(code)),
+        detail === '' ? null : h('span', { className: 'dsh-bal-health-detail' }, detail),
+      );
+    }
+
     /** The full balance page registered in the `main` slot. */
     function BalancePage() {
       const state = useStore();
@@ -1080,6 +1249,17 @@ window.__ModuleLoader__.load({
             : '';
       const updateAvailable =
         update.available === true && typeof update.latestVersion === 'string';
+      const statuses =
+        snapshot?.status !== null && typeof snapshot?.status === 'object'
+          ? snapshot.status
+          : {};
+      const healthRows = [];
+      if (statuses.opencode !== undefined) {
+        healthRows.push({ kind: 'opencode', row: statuses.opencode });
+      }
+      if (statuses.deepseek !== undefined) {
+        healthRows.push({ kind: 'deepseek', row: statuses.deepseek });
+      }
 
       return h(
         'section',
@@ -1213,6 +1393,24 @@ window.__ModuleLoader__.load({
                 { className: 'dsh-bal-list' },
                 orderedSources.map((source) =>
                   h(BalanceRow, { source, pricing: state.pricingPeriod, key: source.id }),
+                ),
+              )
+            : null,
+          snapshot !== null && sources.length > 0 && healthRows.length > 0
+            ? h(
+                'section',
+                { className: 'dsh-bal-health' },
+                h(
+                  'h2',
+                  { className: 'dsh-bal-health-title' },
+                  tr('health.title', 'Service status'),
+                ),
+                h(
+                  'ul',
+                  { className: 'dsh-bal-health-list' },
+                  healthRows.map((item) =>
+                    h(HealthRow, { kind: item.kind, row: item.row, key: item.kind }),
+                  ),
                 ),
               )
             : null,

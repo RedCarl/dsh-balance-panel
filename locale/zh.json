@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "余额与用量",
-    "description": "在左侧栏显示当前会话所用平台的余额与 DeepSeek 峰谷定价，跟随模型/会话切换，并在会话更新后静默刷新。"
+    "description": "在左侧栏显示当前会话所用平台的余额与 DeepSeek 峰谷定价，跟随模型/会话切换，并在会话更新后静默刷新；同时显示 OpenCode Go 速度与 DeepSeek 官方服务状态。"
   }
 }
