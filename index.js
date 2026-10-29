@@ -14,31 +14,29 @@
  * refreshed shortly afterwards so the left-sidebar entry can show the latest
  * amount without a separate notification.
  *
- * The plugin also checks its own GitHub releases and can update a git checkout
- * on demand. Update checks are cached; the update endpoint uses the same browser
- * trust fence as the read-only snapshot route.
+ * The plugin also checks the private registry for its own newer versions and
+ * can install one on demand. Update checks are cached; the update endpoint uses
+ * the same browser trust fence as the read-only snapshot route.
  */
 
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import {
+  UPDATE_REGISTRY,
+  applyUpdate,
+  checkForUpdate,
+  readPackageVersion,
+  resolveInstall,
+  scheduleReload,
+} from './lib/update.js';
 
 /** Stable route used by the browser half. */
 export const ROUTE = '/plugins/balance-panel/state';
 
-/** GitHub release endpoint used by the one-click update flow. */
+/** Registry update endpoint used by the one-click update flow. */
 export const UPDATE_ROUTE = '/plugins/balance-panel/update';
 
-/** Package identity and source repository. */
+/** Package identity and running version. */
 const PACKAGE_NAME = '@local/dsh-balance-panel';
-const REPOSITORY = 'RedCarl/dsh-balance-panel';
-const GITHUB_URL = 'https://github.com/RedCarl/dsh-balance-panel';
-const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
-const execFileAsync = promisify(execFile);
-const UPDATE_CACHE_MS = 30 * 60_000;
+const PLUGIN_VERSION = readPackageVersion(import.meta.url) ?? '0.0.0';
 
 /** Public status endpoints used by the service-health section. */
 const OPENCODE_STATUS_URL = 'https://status.opencode.ai/api/status';
@@ -492,26 +490,6 @@ async function queryProvider(adapter, options) {
   }
 }
 
-/** Numeric semver parts; non-numeric suffixes are ignored. */
-function versionParts(value) {
-  return String(value ?? '')
-    .replace(/^v/i, '')
-    .split(/[.+-]/)
-    .slice(0, 3)
-    .map((part) => Number.parseInt(part, 10) || 0);
-}
-
-/** Whether `latest` is a newer release than `current`. */
-function isNewerVersion(latest, current) {
-  const left = versionParts(latest);
-  const right = versionParts(current);
-  for (let index = 0; index < 3; index += 1) {
-    if (left[index] > right[index]) return true;
-    if (left[index] < right[index]) return false;
-  }
-  return false;
-}
-
 /** Read a small JSON request body. */
 async function readRequestBody(req, limit = 8192) {
   let text = '';
@@ -722,13 +700,6 @@ export function apply(ctx, config) {
   let previousAmounts = new Map();
   const modelCache = new Map();
   let settingsCache = { at: 0, value: undefined };
-  let updateCache = {
-    at: 0,
-    latestVersion: undefined,
-    releaseUrl: undefined,
-    publishedAt: undefined,
-    error: undefined,
-  };
   let updateInFlight = false;
   let opencodeStatusCache = { at: 0, value: undefined };
   let deepseekStatusCache = { at: 0, value: undefined };
@@ -925,142 +896,72 @@ export function apply(ctx, config) {
     };
   };
 
-  /** Read this package's version from the installed manifest. */
-  const readLocalVersion = async () => {
+  /** Whether this Host can install a registry version on demand. */
+  const updateInstallable = () => {
     try {
-      const manifest = JSON.parse(await readFile(join(PLUGIN_DIR, 'package.json'), 'utf8'));
-      return typeof manifest.version === 'string' && manifest.version !== ''
-        ? manifest.version
-        : '0.0.0';
+      const manager = ctx.get?.('pluginManager');
+      return Boolean(manager && typeof manager.installBundle === 'function');
     } catch {
-      return '0.0.0';
+      return false;
     }
-  };
-
-  /** Whether this installation is a git checkout. */
-  const installMode = () => (existsSync(join(PLUGIN_DIR, '.git')) ? 'git' : 'bundle');
-
-  /** Run one fixed git command inside the plugin checkout. */
-  const runGit = async (args) =>
-    execFileAsync('git', args, {
-      cwd: PLUGIN_DIR,
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-    });
-
-  /** Read the latest GitHub release (or tag when no release exists). */
-  const fetchLatestRelease = async () => {
-    const headers = { 'user-agent': 'dsh-balance-panel' };
-    const response = await fetchJson(
-      `https://api.github.com/repos/${REPOSITORY}/releases/latest`,
-      headers,
-      settings.timeoutMs,
-    );
-    let tag = '';
-    let releaseUrl = '';
-    let publishedAt = '';
-    if (response.ok) {
-      const body = response.body;
-      tag = typeof body?.tag_name === 'string' ? body.tag_name.replace(/^v/i, '') : '';
-      releaseUrl = typeof body?.html_url === 'string' ? body.html_url : '';
-      publishedAt = typeof body?.published_at === 'string' ? body.published_at : '';
-    } else if (response.status === 404) {
-      const tags = await fetchJson(
-        `https://api.github.com/repos/${REPOSITORY}/tags?per_page=1`,
-        headers,
-        settings.timeoutMs,
-      );
-      const first = Array.isArray(tags.body) ? tags.body[0] : undefined;
-      tag = typeof first?.name === 'string' ? first.name.replace(/^v/i, '') : '';
-      releaseUrl = tag === '' ? GITHUB_URL : `${GITHUB_URL}/releases/tag/v${tag}`;
-    } else {
-      throw new Error(`GitHub HTTP ${response.status}`);
-    }
-    if (tag === '') throw new Error('GitHub release has no version tag');
-    return { version: tag, releaseUrl: releaseUrl || GITHUB_URL, publishedAt };
-  };
-
-  /** Check GitHub, caching the latest release for a short while. */
-  const checkUpdate = async (force) => {
-    const currentVersion = await readLocalVersion();
-    const now = Date.now();
-    if (force || updateCache.at === 0 || now - updateCache.at > UPDATE_CACHE_MS) {
-      try {
-        const release = await fetchLatestRelease();
-        updateCache = {
-          at: now,
-          latestVersion: release.version,
-          releaseUrl: release.releaseUrl,
-          publishedAt: release.publishedAt,
-          error: undefined,
-        };
-      } catch (error) {
-        updateCache = {
-          at: now,
-          latestVersion: undefined,
-          releaseUrl: undefined,
-          publishedAt: undefined,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    }
-    const latestVersion = updateCache.latestVersion;
-    return {
-      ok: updateCache.error === undefined,
-      currentVersion,
-      latestVersion,
-      available:
-        typeof latestVersion === 'string' && isNewerVersion(latestVersion, currentVersion),
-      releaseUrl: updateCache.releaseUrl,
-      publishedAt: updateCache.publishedAt,
-      mode: installMode(),
-      checkedAt: new Date(updateCache.at).toISOString(),
-      error: updateCache.error,
-    };
   };
 
   /**
-   * Reload this plugin entry after a git checkout changed on disk. The current
-   * request has already been answered; disabling and re-enabling the entry lets
-   * the Loader import the new Host code.
+   * Check the private registry and map the canonical update state onto the
+   * fields the browser half reads. The client speaks `git`/`bundle`, while the
+   * shared module classifies the install as `link`/`package`.
    */
-  const scheduleSelfReload = () => {
-    setTimeout(() => {
-      void (async () => {
-        try {
-          const manager = ctx.get('pluginManager');
-          if (manager === undefined) return;
-          const entries = await manager.listPlugins();
-          const entry = entries.find(
-            (candidate) =>
-              candidate.moduleName === PACKAGE_NAME && candidate.enabled !== false,
-          );
-          if (entry === undefined) return;
-          try {
-            await manager.setPluginEnabled(entry.entryId, false);
-          } catch {
-            // Keep going: a failed disable may still be enabled.
-          }
-          try {
-            await manager.setPluginEnabled(entry.entryId, true);
-          } catch {
-            // The next page load reports the installed version.
-          }
-        } catch {
-          // Best-effort reload; the client still reloads its bundle.
-        }
-      })();
-    }, 1200);
+  const checkUpdate = async (force) => {
+    const install = resolveInstall({ metaUrl: import.meta.url, packageName: PACKAGE_NAME });
+    const info = await checkForUpdate({
+      packageName: PACKAGE_NAME,
+      currentVersion: PLUGIN_VERSION,
+      installedVersion: readPackageVersion(install.packageDir),
+      mode: install.mode,
+      installable: updateInstallable(),
+      force,
+      registry: UPDATE_REGISTRY,
+      userAgent: `dsh-balance-panel/${PLUGIN_VERSION}`,
+    });
+    return {
+      ok: info.ok,
+      currentVersion: info.currentVersion,
+      latestVersion: info.latestVersion,
+      available: info.available === true,
+      releaseUrl: info.releaseUrl,
+      publishedAt: info.publishedAt,
+      mode: install.mode === 'link' ? 'git' : 'bundle',
+      checkedAt: info.checkedAt,
+      tarball: info.tarball,
+      integrity: info.integrity,
+      error: info.error,
+      restartRequired: info.restartRequired === true,
+    };
   };
 
-  /** Apply the latest release to the current installation. */
+  /** Apply the registry's latest version to the current installation. */
   const performUpdate = async () => {
     if (updateInFlight) throw new Error('an update is already running');
     updateInFlight = true;
     try {
       const check = await checkUpdate(true);
+      if (check.ok !== true) throw new Error(check.error ?? 'update check failed');
+      const install = resolveInstall({ metaUrl: import.meta.url, packageName: PACKAGE_NAME });
+      const installedVersion = readPackageVersion(install.packageDir);
       if (!check.available) {
+        if (check.restartRequired === true) {
+          return {
+            ok: true,
+            updated: true,
+            from: check.currentVersion,
+            to: installedVersion ?? check.currentVersion,
+            mode: check.mode,
+            application: 'restart-required',
+            restartRequired: true,
+            alreadyInstalled: true,
+            message: 'updated; restart DSH',
+          };
+        }
         return {
           ok: true,
           updated: false,
@@ -1070,55 +971,60 @@ export function apply(ctx, config) {
           message: 'already up to date',
         };
       }
-      if (check.mode === 'git') {
-        const origin = (await runGit(['remote', 'get-url', 'origin'])).stdout.trim();
-        if (!origin.includes(REPOSITORY)) {
-          throw new Error(`origin is not ${REPOSITORY}`);
-        }
-        const dirty = (await runGit(['status', '--porcelain'])).stdout.trim();
-        if (dirty !== '') {
-          throw new Error('the checkout has local changes; commit or stash them first');
-        }
-        await runGit(['pull', '--ff-only']);
-        const to = await readLocalVersion();
-        if (!isNewerVersion(to, check.currentVersion)) {
-          return {
-            ok: true,
-            updated: false,
-            from: check.currentVersion,
-            to,
-            mode: 'git',
-            message: 'already up to date',
-          };
-        }
-        scheduleSelfReload();
+      const manager = ctx.get?.('pluginManager');
+      const result = await applyUpdate({
+        packageName: PACKAGE_NAME,
+        targetVersion: check.latestVersion,
+        mode: install.mode,
+        packageDir: install.packageDir,
+        pluginManager: manager,
+        tarballUrl: check.tarball,
+      });
+      if (result.method === 'git') {
+        scheduleReload(ctx, PACKAGE_NAME);
         return {
           ok: true,
           updated: true,
-          from: check.currentVersion,
-          to,
+          from: result.from ?? check.currentVersion,
+          to: result.to,
           mode: 'git',
           reload: true,
           latestVersion: check.latestVersion,
+          message: result.to === undefined ? 'updated' : `updated to v${result.to}`,
         };
       }
-      const manager = ctx.get('pluginManager');
-      if (manager === undefined) throw new Error('pluginManager is unavailable');
-      // A tagged git spec differs from the recorded dependency, so the plugin
-      // manager does not refuse it as already installed; pnpm updates the
-      // dependency to that release and the manager reloads the bundle.
-      const result = await manager.installBundle(
-        `${GITHUB_URL}#v${check.latestVersion}`,
-      );
+      const failure =
+        result.error === undefined
+          ? undefined
+          : (result.error.message ?? String(result.error));
+      if (result.application === 'failed') {
+        return {
+          ok: false,
+          updated: false,
+          from: result.from ?? check.currentVersion,
+          to: result.to ?? check.latestVersion,
+          mode: 'bundle',
+          application: result.application,
+          stage: result.stage,
+          restartReason: result.restartReason,
+          warnings: result.warnings,
+          pendingBuilds: result.pendingBuilds,
+          error: failure ?? 'update failed',
+          failure: result.error,
+        };
+      }
       return {
-        ok: result.application !== 'failed',
-        updated: result.changed !== false && result.application !== 'failed',
-        from: check.currentVersion,
-        to: check.latestVersion,
+        ok: true,
+        updated: result.changed !== false,
+        from: result.from ?? check.currentVersion,
+        to: result.to ?? check.latestVersion,
         mode: 'bundle',
         application: result.application,
+        restartRequired: result.restartRequired === true,
         restartReason: result.restartReason,
         warnings: result.warnings,
+        pendingBuilds: result.pendingBuilds,
+        message: result.restartRequired === true ? 'updated; restart DSH' : 'updated',
       };
     } finally {
       updateInFlight = false;
@@ -1274,7 +1180,7 @@ export function apply(ctx, config) {
   /** Build the complete snapshot for one refresh. */
   const buildSnapshot = async (reason, requested) => {
     const generatedAt = new Date().toISOString();
-    const version = await readLocalVersion();
+    const version = PLUGIN_VERSION;
     const current = await readModel(requested);
     const profiles = configuredProviders();
     const sources = [];
@@ -1719,7 +1625,7 @@ export function apply(ctx, config) {
             } catch (error) {
               sendJson(res, 500, {
                 ok: false,
-                currentVersion: await readLocalVersion(),
+                currentVersion: PLUGIN_VERSION,
                 error: error instanceof Error ? error.message : String(error),
               });
             }

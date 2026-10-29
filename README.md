@@ -11,19 +11,17 @@
 - **插件配置里的 `sources`**：完全自定义端点、金额 JSON 路径和币种。
 - **服务状态**：配置了 OpenCode / DeepSeek 来源时，页面底部显示 OpenCode Go 的当前状态与速度（首字延迟、tok/s），以及 DeepSeek 官方状态页中当前模型对应的 API 组件状态。
 
-## 安装（无需 npm）
+## 安装
 
-直接从 GitHub 安装（推荐）：
+从私有 npm 源安装（推荐）：
 
 ```sh
-dsh plugin --profile web add https://github.com/RedCarl/dsh-balance-panel
+dsh plugin --profile web add @local/dsh-balance-panel@latest
 ```
 
-也可以在 DSH 的「设置 → 插件」中粘贴这个 GitHub 地址；安装后刷新页面。
-
-离线或锁定版本时，从 [GitHub Releases](https://github.com/RedCarl/dsh-balance-panel/releases) 下载 `*.tgz`，在安装框中粘贴本地绝对路径。
-
-> 不需要 npmjs 账号；本插件通过 GitHub 仓库和 GitHub Release 分发。
+profile 需要认识 `@local` scope（`dsh-registry enable --profile web` 会写入
+`@local:registry=https://npm.carljoy.cn/`）。也可以直接在
+[npm.carljoy.cn](https://npm.carljoy.cn/) 的 Web 界面下载 tgz 离线安装。
 
 ## DeepSeek 峰谷提示
 
@@ -50,13 +48,15 @@ dsh plugin --profile web add https://github.com/RedCarl/dsh-balance-panel
 
 ## 自动更新
 
-页面标题旁的版本号可以点击检查 GitHub Release。发现新版本时会出现「更新 vX.Y.Z」按钮：
+页面标题旁的版本号可以点击检查更新。检测读取私有源的 packument
+（`https://npm.carljoy.cn/@local%2fdsh-balance-panel`，取 `dist-tags.latest`），
+结果缓存 10 分钟；点击版本号会强制检查。发现新版本时出现「更新 vX.Y.Z」按钮：
 
-- **git 安装**（当前开发目录）：确认 origin 指向 `RedCarl/dsh-balance-panel`、工作区干净后执行 `git pull --ff-only`，然后自动重载插件；页面几秒后刷新。
-- **GitHub 安装**：通过插件管理器的 `installBundle` 更新。
-- tarball/离线安装不支持自动覆盖，请下载新 tgz 重新安装。
+- **源码安装（link:/git）**：工作区干净时执行 `git pull --ff-only`，成功后自动重载插件。
+- **打包安装**：交给 DSH 插件管理器安装 registry 上的同一版本；HMR 拒绝覆盖时回退到该版本的 registry tarball。
+- 升级失败（例如版本与当前 DSH 不兼容）会在页面上显示插件管理器返回的原因。
 
-检查结果缓存 30 分钟；点击版本号会强制检查。更新只访问 GitHub Releases API，不会读取或上传任何密钥。
+更新只访问私有源，不读取或上传任何密钥。
 
 ## 静默刷新
 
