@@ -1262,13 +1262,17 @@ export function apply(ctx, config) {
               typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
             const input = count(usage.inputTokens);
             const output = count(usage.outputTokens);
+            const cacheRead = count(usage.cacheReadTokens);
+            const cacheWrite = count(usage.cacheWriteTokens);
             const providerTotal = count(usage.totalTokens);
             const row = {
               input,
               output,
-              total: Math.max(providerTotal, input + output),
-              cacheRead: count(usage.cacheReadTokens),
-              cacheWrite: count(usage.cacheWriteTokens),
+              // The provider's total is authoritative; without one, account for
+              // both uncached prompt tokens and cache traffic.
+              total: providerTotal > 0 ? providerTotal : input + output + cacheRead + cacheWrite,
+              cacheRead,
+              cacheWrite,
             };
             totals.total += row.total;
             totals.input += row.input;
