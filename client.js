@@ -12,6 +12,8 @@ window.__ModuleLoader__.load({
     const ROUTE = '/plugins/balance-panel/state';
     /** Host update check/apply route. */
     const UPDATE_ROUTE = '/plugins/balance-panel/update';
+    /** Token-usage aggregation route. */
+    const TOKENS_ROUTE = '/plugins/balance-panel/tokens';
     /** Client poll interval while the page is visible. */
     const POLL_MS = 15_000;
 
@@ -68,6 +70,24 @@ window.__ModuleLoader__.load({
       'health.overall': '整体',
       'health.reason.upstream': '上游问题',
       'health.reason.latency': '延迟',
+      'tokens.title': 'Token 统计',
+      'tokens.hour': '时',
+      'tokens.day': '日',
+      'tokens.month': '月',
+      'tokens.year': '年',
+      'tokens.range.hour': '最近 24 小时',
+      'tokens.range.day': '最近 30 天',
+      'tokens.range.month': '最近 12 个月',
+      'tokens.range.year': '最近 5 年',
+      'tokens.total': '合计',
+      'tokens.input': '输入',
+      'tokens.output': '输出',
+      'tokens.cacheRead': '缓存读',
+      'tokens.requests': '次',
+      'tokens.empty': '暂无 Token 记录',
+      'tokens.loading': '统计中…',
+      'tokens.error': '统计不可用',
+      'tokens.zone': '北京时间',
       'platform.account': '账号',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -139,6 +159,24 @@ window.__ModuleLoader__.load({
       'health.overall': 'Overall',
       'health.reason.upstream': 'Upstream',
       'health.reason.latency': 'Latency',
+      'tokens.title': 'Token usage',
+      'tokens.hour': 'Hour',
+      'tokens.day': 'Day',
+      'tokens.month': 'Month',
+      'tokens.year': 'Year',
+      'tokens.range.hour': 'Last 24 hours',
+      'tokens.range.day': 'Last 30 days',
+      'tokens.range.month': 'Last 12 months',
+      'tokens.range.year': 'Last 5 years',
+      'tokens.total': 'Total',
+      'tokens.input': 'Input',
+      'tokens.output': 'Output',
+      'tokens.cacheRead': 'Cache read',
+      'tokens.requests': 'requests',
+      'tokens.empty': 'No token records',
+      'tokens.loading': 'Loading…',
+      'tokens.error': 'Token stats unavailable',
+      'tokens.zone': 'Beijing time',
       'platform.account': 'Account',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -252,6 +290,88 @@ window.__ModuleLoader__.load({
         line-height: 17px;
       }
       .dsh-bal-updateline.error { color: var(--dsw-alias-state-error-primary); }
+      .dsh-bal-tokens {
+        margin-top: 24px;
+        padding-top: 16px;
+        border-top: 0.5px solid var(--dsw-alias-border-l1);
+      }
+      .dsh-bal-token-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .dsh-bal-token-title {
+        margin: 0;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 18px;
+      }
+      .dsh-bal-token-tabs {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        padding: 2px;
+        border-radius: 6px;
+        background: var(--dsw-alias-bg-layer-2);
+      }
+      .dsh-bal-token-tab {
+        padding: 2px 8px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--dsw-alias-label-secondary);
+        font: inherit;
+        font-size: 11px;
+        line-height: 16px;
+        cursor: pointer;
+      }
+      .dsh-bal-token-tab:hover { color: var(--dsw-alias-label-primary); }
+      .dsh-bal-token-tab.active {
+        background: var(--dsw-alias-bg-base);
+        color: var(--dsw-alias-label-primary);
+        box-shadow: 0 0 0 0.5px var(--dsw-alias-border-l1);
+      }
+      .dsh-bal-token-tab:focus-visible {
+        outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary));
+        outline-offset: 1px;
+      }
+      .dsh-bal-token-chart {
+        display: block;
+        width: 100%;
+        height: auto;
+        margin-top: 8px;
+      }
+      .dsh-bal-token-chart text {
+        fill: var(--dsw-alias-label-secondary);
+        font-size: 10px;
+      }
+      .dsh-bal-token-chart .dsh-bal-token-bar {
+        fill: var(--dsw-alias-brand-primary);
+        opacity: 0.82;
+      }
+      .dsh-bal-token-chart .dsh-bal-token-bar:hover { opacity: 1; }
+      .dsh-bal-token-summary {
+        margin: 4px 0 0;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 11px;
+        line-height: 17px;
+        overflow-wrap: anywhere;
+      }
+      .dsh-bal-token-range {
+        margin: 2px 0 0;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 11px;
+        line-height: 17px;
+      }
+      .dsh-bal-token-empty {
+        margin: 8px 0 0;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 11px;
+        line-height: 17px;
+      }
       .dsh-bal-health {
         margin-top: 24px;
         padding-top: 16px;
@@ -503,10 +623,18 @@ window.__ModuleLoader__.load({
         message: null,
         messageError: false,
       },
+      tokens: {
+        status: 'idle',
+        data: null,
+        error: null,
+        tab: 'day',
+        loading: false,
+      },
     });
 
     let pricingPeriod = initialPricing;
     let updateGeneration = 0;
+    let tokenGeneration = 0;
     let loadGeneration = 0;
     let loadingCount = 0;
     let lastLoadedAt = 0;
@@ -886,6 +1014,68 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Load the year/month/day/hour token aggregation. */
+    async function loadTokens(force) {
+      const generation = ++tokenGeneration;
+      const before = store.get();
+      store.set({
+        ...before,
+        tokens: {
+          ...before.tokens,
+          status: before.tokens.data === null ? 'loading' : before.tokens.status,
+          loading: true,
+          error: null,
+        },
+      });
+      try {
+        const response = await fetch(`${TOKENS_ROUTE}${force ? '?refresh=1' : ''}`, {
+          headers: { accept: 'application/json' },
+          cache: 'no-store',
+        });
+        const data = await response.json().catch(() => null);
+        if (generation !== tokenGeneration) return;
+        const current = store.get();
+        if (data === null || typeof data !== 'object' || data.ok === false) {
+          throw new Error(
+            data !== null && typeof data?.error === 'string'
+              ? data.error
+              : `HTTP ${response.status}`,
+          );
+        }
+        store.set({
+          ...current,
+          tokens: {
+            ...current.tokens,
+            status: 'ready',
+            data,
+            error: null,
+            loading: false,
+          },
+        });
+      } catch (error) {
+        if (generation !== tokenGeneration) return;
+        const current = store.get();
+        const hasData = current.tokens.data !== null;
+        store.set({
+          ...current,
+          tokens: {
+            ...current.tokens,
+            status: hasData ? 'ready' : 'error',
+            error: error instanceof Error ? error.message : String(error),
+            loading: false,
+          },
+        });
+      }
+    }
+
+    /** Switch the token chart granularity without refetching. */
+    function setTokenTab(tab) {
+      if (tab !== 'hour' && tab !== 'day' && tab !== 'month' && tab !== 'year') return;
+      const current = store.get();
+      if (current.tokens.tab === tab) return;
+      store.set({ ...current, tokens: { ...current.tokens, tab } });
+    }
+
     /** Subscribe a component to the shared store. */
     function useStore() {
       return React.useSyncExternalStore(store.subscribe, store.get, store.get);
@@ -1205,6 +1395,165 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** Compact token count for chart labels. */
+    function formatTokenCount(value) {
+      const count = Number(value) || 0;
+      if (count >= 1_000_000_000) return `${(count / 1_000_000_000).toFixed(2)}B`;
+      if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(2)}M`;
+      if (count >= 1_000) return `${(count / 1_000).toFixed(1)}K`;
+      return String(Math.round(count));
+    }
+
+    /** Exact token count used in hover titles. */
+    function exactTokenCount(value) {
+      return Math.round(Number(value) || 0).toLocaleString('en-US');
+    }
+
+    /** The range label for one token tab. */
+    function tokenRangeText(tab) {
+      if (tab === 'hour') return tr('tokens.range.hour', 'Last 24 hours');
+      if (tab === 'month') return tr('tokens.range.month', 'Last 12 months');
+      if (tab === 'year') return tr('tokens.range.year', 'Last 5 years');
+      return tr('tokens.range.day', 'Last 30 days');
+    }
+
+    /** Year/month/day/hour token chart plus the selected range totals. */
+    function TokenStats({ tokens, onTab }) {
+      const tab = tokens.tab;
+      const data = tokens.data;
+      const ranges = Array.isArray(data?.buckets?.[tab]) ? data.buckets[tab] : [];
+      const total = ranges.reduce((sum, bucket) => sum + (Number(bucket.total) || 0), 0);
+      const input = ranges.reduce((sum, bucket) => sum + (Number(bucket.input) || 0), 0);
+      const output = ranges.reduce((sum, bucket) => sum + (Number(bucket.output) || 0), 0);
+      const cacheRead = ranges.reduce((sum, bucket) => sum + (Number(bucket.cacheRead) || 0), 0);
+      const requests = ranges.reduce((sum, bucket) => sum + (Number(bucket.requests) || 0), 0);
+      const tabs = [
+        ['hour', tr('tokens.hour', 'Hour')],
+        ['day', tr('tokens.day', 'Day')],
+        ['month', tr('tokens.month', 'Month')],
+        ['year', tr('tokens.year', 'Year')],
+      ];
+      const width = 640;
+      const height = 140;
+      const plot = 104;
+      const count = Math.max(1, ranges.length);
+      const slot = width / count;
+      const barWidth = Math.max(1.5, slot * 0.68);
+      const max = Math.max(1, ...ranges.map((bucket) => Number(bucket.total) || 0));
+      const labelIndices = [
+        ...new Set([0, Math.floor((count - 1) / 3), Math.floor((2 * (count - 1)) / 3), count - 1]),
+      ].filter((index) => index >= 0 && index < count);
+      const chart =
+        total === 0
+          ? null
+          : h(
+              'svg',
+              {
+                className: 'dsh-bal-token-chart',
+                viewBox: `0 0 ${width} ${height}`,
+                role: 'img',
+                'aria-label': `${tr('tokens.title', 'Token usage')} ${tokenRangeText(tab)} ${formatTokenCount(total)}`,
+              },
+              h('line', {
+                x1: 0,
+                y1: plot,
+                x2: width,
+                y2: plot,
+                stroke: 'var(--dsw-alias-border-l1)',
+                strokeWidth: 1,
+              }),
+              ranges.map((bucket, index) => {
+                const value = Number(bucket.total) || 0;
+                const barHeight = value === 0 ? 0 : Math.max(1, (value / max) * plot);
+                const x = index * slot + (slot - barWidth) / 2;
+                const title = `${bucket.label} · ${exactTokenCount(value)} tokens · ${tr('tokens.input', 'Input')} ${exactTokenCount(bucket.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(bucket.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(bucket.cacheRead)} · ${bucket.requests} ${tr('tokens.requests', 'requests')}`;
+                return h(
+                  'rect',
+                  {
+                    key: bucket.key,
+                    className: 'dsh-bal-token-bar',
+                    x,
+                    y: plot - barHeight,
+                    width: barWidth,
+                    height: barHeight,
+                    rx: 1.5,
+                  },
+                  h('title', null, title),
+                );
+              }),
+              labelIndices.map((index) =>
+                h(
+                  'text',
+                  {
+                    key: `label-${index}`,
+                    x: (index + 0.5) * slot,
+                    y: 128,
+                    textAnchor: 'middle',
+                  },
+                  ranges[index].label,
+                ),
+              ),
+            );
+      return h(
+        'section',
+        { className: 'dsh-bal-tokens' },
+        h(
+          'div',
+          { className: 'dsh-bal-token-head' },
+          h('h2', { className: 'dsh-bal-token-title' }, tr('tokens.title', 'Token usage')),
+          h(
+            'div',
+            { className: 'dsh-bal-token-tabs', role: 'tablist' },
+            tabs.map(([key, label]) =>
+              h(
+                'button',
+                {
+                  key,
+                  type: 'button',
+                  className: `dsh-bal-token-tab${tab === key ? ' active' : ''}`,
+                  onClick: () => onTab(key),
+                  role: 'tab',
+                  'aria-selected': tab === key,
+                },
+                label,
+              ),
+            ),
+          ),
+        ),
+        data === null && (tokens.status === 'loading' || tokens.loading)
+          ? h('p', { className: 'dsh-bal-token-empty' }, tr('tokens.loading', 'Loading…'))
+          : null,
+        data === null && tokens.status === 'error'
+          ? h(
+              'p',
+              { className: 'dsh-bal-token-empty', title: tokens.error ?? '' },
+              tr('tokens.error', 'Token stats unavailable'),
+            )
+          : null,
+        data !== null
+          ? h(
+              'p',
+              { className: 'dsh-bal-token-range' },
+              `${tokenRangeText(tab)} · ${tr('tokens.zone', 'Beijing time')}`,
+            )
+          : null,
+        chart,
+        data !== null && total > 0
+          ? h(
+              'p',
+              {
+                className: 'dsh-bal-token-summary',
+                title: `${tr('tokens.total', 'Total')} ${exactTokenCount(total)} · ${tr('tokens.input', 'Input')} ${exactTokenCount(input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(cacheRead)} · ${requests} ${tr('tokens.requests', 'requests')}`,
+              },
+              `${tr('tokens.total', 'Total')} ${formatTokenCount(total)} · ${tr('tokens.input', 'Input')} ${formatTokenCount(input)} · ${tr('tokens.output', 'Output')} ${formatTokenCount(output)} · ${tr('tokens.cacheRead', 'Cache read')} ${formatTokenCount(cacheRead)} · ${requests} ${tr('tokens.requests', 'requests')}`,
+            )
+          : null,
+        data !== null && total === 0
+          ? h('p', { className: 'dsh-bal-token-empty' }, tr('tokens.empty', 'No token records'))
+          : null,
+      );
+    }
+
     /** The full balance page registered in the `main` slot. */
     function BalancePage() {
       const state = useStore();
@@ -1228,12 +1577,18 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         void load(false);
         void checkUpdate(false);
-        const interval = window.setInterval(() => void checkUpdate(false), 30 * 60_000);
-        return () => window.clearInterval(interval);
+        void loadTokens(false);
+        const updateInterval = window.setInterval(() => void checkUpdate(false), 30 * 60_000);
+        const tokenInterval = window.setInterval(() => void loadTokens(false), 10 * 60_000);
+        return () => {
+          window.clearInterval(updateInterval);
+          window.clearInterval(tokenInterval);
+        };
       }, []);
 
       const refresh = () => {
         void load(true);
+        void loadTokens(true);
       };
 
       const currentText =
@@ -1396,6 +1751,7 @@ window.__ModuleLoader__.load({
                 ),
               )
             : null,
+          h(TokenStats, { tokens: state.tokens, onTab: setTokenTab }),
           snapshot !== null && sources.length > 0 && healthRows.length > 0
             ? h(
                 'section',

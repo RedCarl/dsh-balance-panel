@@ -34,6 +34,9 @@ export const ROUTE = '/plugins/balance-panel/state';
 /** Registry update endpoint used by the one-click update flow. */
 export const UPDATE_ROUTE = '/plugins/balance-panel/update';
 
+/** Token-usage aggregation endpoint. */
+export const TOKENS_ROUTE = '/plugins/balance-panel/tokens';
+
 /** Package identity and running version. */
 const PACKAGE_NAME = '@local/dsh-balance-panel';
 const PLUGIN_VERSION = readPackageVersion(import.meta.url) ?? '0.0.0';
@@ -42,6 +45,9 @@ const PLUGIN_VERSION = readPackageVersion(import.meta.url) ?? '0.0.0';
 const OPENCODE_STATUS_URL = 'https://status.opencode.ai/api/status';
 const DEEPSEEK_STATUS_URL = 'https://status.deepseek.com/';
 const STATUS_CACHE_MS = 60_000;
+const TOKEN_CACHE_MS = 10 * 60_000;
+/** Token buckets use Beijing time, matching the pricing/status sections. */
+const TOKEN_TZ_OFFSET_MS = 8 * 60 * 60_000;
 const STATUS_TIMEOUT_MS = 6_000;
 
 /** Services required before the route can mount. */
@@ -703,6 +709,8 @@ export function apply(ctx, config) {
   let updateInFlight = false;
   let opencodeStatusCache = { at: 0, value: undefined };
   let deepseekStatusCache = { at: 0, value: undefined };
+  let tokenCache = { at: 0, value: undefined };
+  let tokenInflight;
 
   /** Read one settings namespace's live value, cached briefly. */
   const settingsValue = (ns) => {
@@ -1175,6 +1183,186 @@ export function apply(ctx, config) {
     if (wantsOpenCode) status.opencode = buildOpenCodeStatus(opencode, current);
     if (wantsDeepSeek) status.deepseek = buildDeepSeekStatus(deepseek, current);
     return status;
+  };
+
+  /** Local bucket key and short label for one timestamp. */
+  const tokenBucket = (date, kind) => {
+    const year = String(date.getUTCFullYear());
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    const hour = String(date.getUTCHours()).padStart(2, '0');
+    if (kind === 'hour') return { key: `${year}-${month}-${day}T${hour}`, label: `${hour}:00` };
+    if (kind === 'day') return { key: `${year}-${month}-${day}`, label: `${month}-${day}` };
+    if (kind === 'month') return { key: `${year}-${month}`, label: `${year}-${month}` };
+    return { key: year, label: year };
+  };
+
+  /** One empty token bucket. */
+  const emptyTokenBucket = () => ({
+    total: 0,
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    requests: 0,
+  });
+
+  /** Scan every persisted session and fold provider-reported token usage by local time. */
+  const scanTokenStats = async () => {
+    const query = ctx.get('sessionQuery');
+    if (
+      query === undefined ||
+      typeof query.listSessions !== 'function' ||
+      typeof query.readSession !== 'function'
+    ) {
+      throw new Error('session query service is unavailable');
+    }
+    const records = await query.listSessions();
+    const maps = {
+      hour: new Map(),
+      day: new Map(),
+      month: new Map(),
+      year: new Map(),
+    };
+    const totals = emptyTokenBucket();
+    let errors = 0;
+    let scanned = 0;
+    const queue = Array.isArray(records) ? [...records] : [];
+    const add = (kind, date, usage) => {
+      const bucket = tokenBucket(date, kind);
+      const entry = maps[kind].get(bucket.key) ?? emptyTokenBucket();
+      entry.total += usage.total;
+      entry.input += usage.input;
+      entry.output += usage.output;
+      entry.cacheRead += usage.cacheRead;
+      entry.cacheWrite += usage.cacheWrite;
+      entry.requests += 1;
+      maps[kind].set(bucket.key, entry);
+    };
+    const worker = async () => {
+      while (queue.length > 0) {
+        const record = queue.shift();
+        const sessionId = record?.header?.id;
+        if (typeof sessionId !== 'string') continue;
+        try {
+          const log = await query.readSession(sessionId);
+          scanned += 1;
+          const events = Array.isArray(log.events) ? log.events : [];
+          const inherited = Math.max(0, Number(log.inheritedEventCount) || 0);
+          for (let index = inherited; index < events.length; index += 1) {
+            const event = events[index];
+            if (event?.type !== 'assistant/message') continue;
+            const usage = event.data?.usage;
+            if (usage === null || typeof usage !== 'object') continue;
+            const time = Number(event.time);
+            if (!Number.isFinite(time)) continue;
+            const date = new Date(time + TOKEN_TZ_OFFSET_MS);
+            if (Number.isNaN(date.getTime())) continue;
+            const count = (value) =>
+              typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+            const input = count(usage.inputTokens);
+            const output = count(usage.outputTokens);
+            const providerTotal = count(usage.totalTokens);
+            const row = {
+              input,
+              output,
+              total: Math.max(providerTotal, input + output),
+              cacheRead: count(usage.cacheReadTokens),
+              cacheWrite: count(usage.cacheWriteTokens),
+            };
+            totals.total += row.total;
+            totals.input += row.input;
+            totals.output += row.output;
+            totals.cacheRead += row.cacheRead;
+            totals.cacheWrite += row.cacheWrite;
+            totals.requests += 1;
+            add('hour', date, row);
+            add('day', date, row);
+            add('month', date, row);
+            add('year', date, row);
+          }
+        } catch {
+          errors += 1;
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(3, queue.length) }, () => worker()),
+    );
+    const now = Date.now();
+    const localNow = new Date(now + TOKEN_TZ_OFFSET_MS);
+    const range = (kind, count) => {
+      const out = [];
+      for (let offset = count - 1; offset >= 0; offset -= 1) {
+        let date;
+        if (kind === 'hour') {
+          date = new Date(localNow);
+          date.setUTCMinutes(0, 0, 0);
+          date.setUTCHours(date.getUTCHours() - offset);
+        } else if (kind === 'day') {
+          date = new Date(localNow);
+          date.setUTCHours(0, 0, 0, 0);
+          date.setUTCDate(date.getUTCDate() - offset);
+        } else if (kind === 'month') {
+          date = new Date(Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth() - offset, 1));
+        } else {
+          date = new Date(Date.UTC(localNow.getUTCFullYear() - offset, 0, 1));
+        }
+        const bucket = tokenBucket(date, kind);
+        const entry = maps[kind].get(bucket.key) ?? emptyTokenBucket();
+        out.push({
+          key: bucket.key,
+          label: bucket.label,
+          start: date.getTime() - TOKEN_TZ_OFFSET_MS,
+          ...entry,
+        });
+      }
+      return out;
+    };
+    const timeZone = 'Asia/Shanghai';
+    return {
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      timeZone,
+      sessions: Array.isArray(records) ? records.length : 0,
+      scanned,
+      errors,
+      totals,
+      buckets: {
+        hour: range('hour', 24),
+        day: range('day', 30),
+        month: range('month', 12),
+        year: range('year', 5),
+      },
+    };
+  };
+
+  /** Cached token statistics; force rescans the corpus. */
+  const getTokenStats = async (force) => {
+    if (!force && tokenCache.value !== undefined && Date.now() - tokenCache.at < TOKEN_CACHE_MS) {
+      return tokenCache.value;
+    }
+    if (tokenInflight !== undefined) return tokenInflight;
+    tokenInflight = (async () => {
+      try {
+        const value = await scanTokenStats();
+        tokenCache = { at: Date.now(), value };
+        return value;
+      } catch (error) {
+        const value = {
+          ok: false,
+          generatedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error),
+          totals: emptyTokenBucket(),
+          buckets: { hour: [], day: [], month: [], year: [] },
+        };
+        tokenCache = { at: Date.now(), value };
+        return value;
+      } finally {
+        tokenInflight = undefined;
+      }
+    })();
+    return tokenInflight;
   };
 
   /** Build the complete snapshot for one refresh. */
@@ -1674,5 +1862,29 @@ export function apply(ctx, config) {
         },
       }),
     `balance-panel: GET/POST ${UPDATE_ROUTE}`,
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: TOKENS_ROUTE,
+        handler: async (req, res) => {
+          if (rejectRequest(req, res)) return;
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            sendJson(res, 405, { ok: false, error: 'method not allowed' });
+            return;
+          }
+          let force = false;
+          try {
+            force = new URL(String(req.url), 'http://localhost').searchParams.get('refresh') === '1';
+          } catch {
+            force = false;
+          }
+          const stats = await getTokenStats(force);
+          sendJson(res, stats.ok === false ? 502 : 200, stats);
+        },
+      }),
+    `balance-panel: GET ${TOKENS_ROUTE}`,
   );
 }
