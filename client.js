@@ -1572,7 +1572,7 @@ window.__ModuleLoader__.load({
         [
           `${tokenProviderLabel(provider)} · ${bucket.label}`,
           `${exactTokenCount(stats.total)} tokens`,
-          `${tr('tokens.input', 'Input')} ${exactTokenCount(stats.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(stats.output)}`,
+          `${tr('tokens.input', 'Input')} ${exactTokenCount(stats.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(stats.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(stats.cacheRead)}`,
         ].join('\n');
       const chart =
         total === 0
