@@ -1500,11 +1500,6 @@ window.__ModuleLoader__.load({
       return String(Math.round(count));
     }
 
-    /** Exact token count used in hover titles. */
-    function exactTokenCount(value) {
-      return Math.round(Number(value) || 0).toLocaleString('en-US');
-    }
-
     /** The range label for one token tab. */
     function tokenRangeText(tab) {
       if (tab === 'hour') return tr('tokens.range.hour', 'Last 24 hours');
@@ -1608,8 +1603,8 @@ window.__ModuleLoader__.load({
       ].filter((index) => index >= 0 && index < count);
       const hoverFor = (provider, bucket, stats) => ({
         title: `${tokenProviderLabel(provider)} · ${bucket.label}`,
-        value: `${exactTokenCount(stats.total)} tokens`,
-        detail: `${tr('tokens.input', 'Input')} ${exactTokenCount(stats.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(stats.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(stats.cacheRead)}`,
+        value: `${formatTokenCount(stats.total)} tokens`,
+        detail: `${tr('tokens.input', 'Input')} ${formatTokenCount(stats.input)} · ${tr('tokens.output', 'Output')} ${formatTokenCount(stats.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${formatTokenCount(stats.cacheRead)}`,
       });
       const chart =
         total === 0
@@ -1760,7 +1755,7 @@ window.__ModuleLoader__.load({
                   'span',
                   {
                     key: provider.id,
-                    title: `${tokenProviderLabel(provider)}\n${exactTokenCount(provider.total)} tokens · ${provider.requests} ${tr('tokens.requests', 'requests')}`,
+                    title: `${tokenProviderLabel(provider)}\n${formatTokenCount(provider.total)} tokens · ${provider.requests} ${tr('tokens.requests', 'requests')}`,
                   },
                   h('i', { style: { background: provider.color }, 'aria-hidden': true }),
                   tokenProviderLabel(provider),
