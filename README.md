@@ -10,7 +10,7 @@
   `/dashboard/billing/subscription` + `/dashboard/billing/usage` 计算余额。
 - **插件配置里的 `sources`**：完全自定义端点、金额 JSON 路径和币种。
 - **服务状态**：配置了 OpenCode / DeepSeek 来源时，页面底部显示 OpenCode Go 的当前状态与速度（首字延迟、tok/s），以及 DeepSeek 官方状态页中当前模型对应的 API 组件状态。
-- **Token 统计**：扫描本地会话日志，按北京时间年 / 月 / 日 / 时聚合 provider 报告的 token 用量，并以柱状图展示；合计包含缓存读取，悬停可看输入、输出、缓存和请求数。
+- **Token 统计**：扫描本地会话日志，按北京时间年 / 月 / 日 / 时聚合 provider 报告的 token 用量，并按 DeepSeek 账号、DeepSeek API、OpenCode Go 等来源堆叠展示；悬停柱段可看精确 Token 数。
 
 ## 安装
 
@@ -43,12 +43,13 @@ profile 需要认识 `@local` scope（`dsh-registry enable --profile web` 会写
 页面底部的「Token 统计」不依赖 API key，读取本机已保存的会话日志：
 
 - 按北京时间聚合 **年 / 月 / 日 / 时**，点击页签切换；
-- 柱状图显示所选区间的总量，悬停可看该时段的输入、输出、缓存读和请求数；
+- 柱状图按 provider / 账号接入方式堆叠：DeepSeek 账号登录、DeepSeek API、OpenCode Go 等；图例显示各来源的区间总量和占比；
+- 悬停任意柱段，显示该来源在该时段的精确 Token 数：总量、输入、输出、缓存读和请求次数；
 - 下方汇总所选区间的合计、输入、输出、缓存读和请求次数；
 - 只统计数据，不读取或上传任何消息内容；
 - 首次统计需要遍历本地会话，可能耗时几秒；结果缓存 10 分钟。
 
-Token 用量取 provider 在 `assistant/message` 中报告的值，包含缓存读取；fork 继承的事件不会重复计数。只统计本机已持久化的会话。
+Token 用量取 provider 在 `assistant/message` 中报告的值，包含缓存读取；fork 继承的事件不会重复计数。只统计本机已持久化的会话。分类来自会话请求头里的 provider 路由：`deepseek-official` 显示为 DeepSeek 账号，`deepseek` 显示为 DeepSeek API，`opencode-go` 显示为 OpenCode Go；同一 provider 下配置多个 API key 时，日志没有单独的账号标识，无法再拆分成多个账号。
 
 ## 服务状态
 

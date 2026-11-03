@@ -88,6 +88,12 @@ window.__ModuleLoader__.load({
       'tokens.loading': '统计中…',
       'tokens.error': '统计不可用',
       'tokens.zone': '北京时间',
+      'tokens.provider.deepseekAccount': 'DeepSeek 账号',
+      'tokens.provider.deepseekApi': 'DeepSeek API',
+      'tokens.provider.opencodeGo': 'OpenCode Go',
+      'tokens.provider.opencode': 'OpenCode',
+      'tokens.provider.unknown': '未知来源',
+      'tokens.hoverHint': '悬停柱状图查看具体 Token',
       'platform.account': '账号',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -177,6 +183,12 @@ window.__ModuleLoader__.load({
       'tokens.loading': 'Loading…',
       'tokens.error': 'Token stats unavailable',
       'tokens.zone': 'Beijing time',
+      'tokens.provider.deepseekAccount': 'DeepSeek account',
+      'tokens.provider.deepseekApi': 'DeepSeek API',
+      'tokens.provider.opencodeGo': 'OpenCode Go',
+      'tokens.provider.opencode': 'OpenCode',
+      'tokens.provider.unknown': 'Unknown',
+      'tokens.hoverHint': 'Hover a bar to see exact tokens',
       'platform.account': 'Account',
       'platform.deepseek': 'DeepSeek',
       'platform.opencode': 'OpenCode',
@@ -349,10 +361,54 @@ window.__ModuleLoader__.load({
         font-size: 10px;
       }
       .dsh-bal-token-chart .dsh-bal-token-bar {
-        fill: var(--dsw-alias-brand-primary);
         opacity: 0.82;
+        cursor: default;
       }
-      .dsh-bal-token-chart .dsh-bal-token-bar:hover { opacity: 1; }
+      .dsh-bal-token-chart .dsh-bal-token-bar:hover {
+        opacity: 1;
+      }
+      .dsh-bal-token-chart .dsh-bal-token-bar:focus-visible {
+        opacity: 1;
+        outline: none;
+        stroke: var(--dsw-alias-label-primary);
+        stroke-width: 1;
+      }
+      .dsh-bal-token-hover {
+        margin: 4px 0 0;
+        min-height: 17px;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 11px;
+        line-height: 17px;
+        overflow-wrap: anywhere;
+      }
+      .dsh-bal-token-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px 14px;
+        margin-top: 5px;
+        color: var(--dsw-alias-label-secondary);
+        font-size: 11px;
+        line-height: 17px;
+      }
+      .dsh-bal-token-legend span {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        min-width: 0;
+        font-variant-numeric: tabular-nums;
+      }
+      .dsh-bal-token-legend i {
+        width: 7px;
+        height: 7px;
+        flex: none;
+        border-radius: 2px;
+      }
+      .dsh-bal-token-legend em {
+        color: var(--dsw-alias-label-secondary);
+        font-style: normal;
+        font-size: 10px;
+        opacity: 0.8;
+      }
       .dsh-bal-token-summary {
         margin: 4px 0 0;
         color: var(--dsw-alias-label-secondary);
@@ -1445,9 +1501,56 @@ window.__ModuleLoader__.load({
       return tr('tokens.range.day', 'Last 30 days');
     }
 
-    /** Year/month/day/hour token chart plus the selected range totals. */
+    /** Palette used for provider/account segments. */
+    const TOKEN_COLORS = [
+      'var(--dsw-alias-brand-primary)',
+      'var(--dsw-alias-state-success-primary)',
+      '#8b5cf6',
+      '#06b6d4',
+      '#f59e0b',
+      '#ec4899',
+      '#84cc16',
+      '#64748b',
+    ];
+
+    /** Localized label for a logged provider route. */
+    function tokenProviderLabel(provider) {
+      const id = typeof provider?.id === 'string' ? provider.id : '';
+      if (id === 'deepseek-official') return tr('tokens.provider.deepseekAccount', 'DeepSeek account');
+      if (id === 'deepseek') return tr('tokens.provider.deepseekApi', 'DeepSeek API');
+      if (id === 'opencode-go') return tr('tokens.provider.opencodeGo', 'OpenCode Go');
+      if (id === 'opencode') return tr('tokens.provider.opencode', 'OpenCode');
+      if (id === 'unknown' || id === '') return tr('tokens.provider.unknown', 'Unknown');
+      return typeof provider?.label === 'string' && provider.label !== '' ? provider.label : id;
+    }
+
+    /** Stable color for one provider slot. */
+    function tokenProviderColor(index) {
+      return TOKEN_COLORS[index % TOKEN_COLORS.length];
+    }
+
+    /** Empty range counter for one provider. */
+    function emptyTokenRange() {
+      return { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0 };
+    }
+
+    /** Add one provider bucket to a range counter. */
+    function addTokenRange(target, stats) {
+      target.total += Number(stats?.total) || 0;
+      target.input += Number(stats?.input) || 0;
+      target.output += Number(stats?.output) || 0;
+      target.cacheRead += Number(stats?.cacheRead) || 0;
+      target.cacheWrite += Number(stats?.cacheWrite) || 0;
+      target.requests += Number(stats?.requests) || 0;
+    }
+
+    /** Year/month/day/hour token chart, stacked by provider/account. */
     function TokenStats({ tokens, onTab }) {
+      const [hoverText, setHoverText] = React.useState(null);
       const tab = tokens.tab;
+      React.useEffect(() => {
+        setHoverText(null);
+      }, [tab]);
       const data = tokens.data;
       const ranges = Array.isArray(data?.buckets?.[tab]) ? data.buckets[tab] : [];
       const total = ranges.reduce((sum, bucket) => sum + (Number(bucket.total) || 0), 0);
@@ -1461,6 +1564,39 @@ window.__ModuleLoader__.load({
         ['month', tr('tokens.month', 'Month')],
         ['year', tr('tokens.year', 'Year')],
       ];
+      const declaredProviders = Array.isArray(data?.providers) ? data.providers : [];
+      const providerMap = new Map();
+      for (const provider of declaredProviders) {
+        if (provider === null || typeof provider !== 'object' || typeof provider.id !== 'string') continue;
+        providerMap.set(provider.id, {
+          ...provider,
+          color: tokenProviderColor(providerMap.size),
+        });
+      }
+      for (const bucket of ranges) {
+        for (const id of Object.keys(bucket.providers ?? {})) {
+          if (!providerMap.has(id)) {
+            providerMap.set(id, {
+              id,
+              label: id,
+              color: tokenProviderColor(providerMap.size),
+            });
+          }
+        }
+      }
+      const rangeProviders = new Map();
+      for (const provider of providerMap.values()) {
+        rangeProviders.set(provider.id, { ...provider, ...emptyTokenRange() });
+      }
+      for (const bucket of ranges) {
+        for (const [id, stats] of Object.entries(bucket.providers ?? {})) {
+          const target = rangeProviders.get(id);
+          if (target !== undefined) addTokenRange(target, stats);
+        }
+      }
+      const providerRows = [...rangeProviders.values()].filter(
+        (provider) => provider.total > 0,
+      );
       const width = 640;
       const height = 140;
       const plot = 104;
@@ -1471,6 +1607,8 @@ window.__ModuleLoader__.load({
       const labelIndices = [
         ...new Set([0, Math.floor((count - 1) / 3), Math.floor((2 * (count - 1)) / 3), count - 1]),
       ].filter((index) => index >= 0 && index < count);
+      const hoverFor = (provider, bucket, stats) =>
+        `${tokenProviderLabel(provider)} · ${bucket.label} · ${tr('tokens.total', 'Total')} ${exactTokenCount(stats.total)} · ${tr('tokens.input', 'Input')} ${exactTokenCount(stats.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(stats.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(stats.cacheRead)} · ${stats.requests} ${tr('tokens.requests', 'requests')}`;
       const chart =
         total === 0
           ? null
@@ -1490,24 +1628,41 @@ window.__ModuleLoader__.load({
                 stroke: 'var(--dsw-alias-border-l1)',
                 strokeWidth: 1,
               }),
-              ranges.map((bucket, index) => {
-                const value = Number(bucket.total) || 0;
-                const barHeight = value === 0 ? 0 : Math.max(1, (value / max) * plot);
-                const x = index * slot + (slot - barWidth) / 2;
-                const title = `${bucket.label} · ${exactTokenCount(value)} tokens · ${tr('tokens.input', 'Input')} ${exactTokenCount(bucket.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(bucket.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(bucket.cacheRead)} · ${bucket.requests} ${tr('tokens.requests', 'requests')}`;
-                return h(
-                  'rect',
-                  {
-                    key: bucket.key,
-                    className: 'dsh-bal-token-bar',
-                    x,
-                    y: plot - barHeight,
-                    width: barWidth,
-                    height: barHeight,
-                    rx: 1.5,
-                  },
-                  h('title', null, title),
-                );
+              ranges.flatMap((bucket, index) => {
+                let offset = 0;
+                const segments = [];
+                for (const provider of providerRows) {
+                  const stats = bucket.providers?.[provider.id];
+                  const value = Number(stats?.total) || 0;
+                  if (value <= 0) continue;
+                  const segmentHeight = (value / max) * plot;
+                  const x = index * slot + (slot - barWidth) / 2;
+                  const y = plot - offset - segmentHeight;
+                  offset += segmentHeight;
+                  const text = hoverFor(provider, bucket, stats);
+                  segments.push(
+                    h(
+                      'rect',
+                      {
+                        key: `${bucket.key}-${provider.id}`,
+                        className: 'dsh-bal-token-bar',
+                        x,
+                        y,
+                        width: barWidth,
+                        height: segmentHeight,
+                        rx: 1.5,
+                        fill: provider.color,
+                        tabIndex: 0,
+                        onMouseEnter: () => setHoverText(text),
+                        onMouseLeave: () => setHoverText(null),
+                        onFocus: () => setHoverText(text),
+                        onBlur: () => setHoverText(null),
+                      },
+                      h('title', null, text),
+                    ),
+                  );
+                }
+                return segments;
               }),
               labelIndices.map((index) =>
                 h(
@@ -1566,6 +1721,30 @@ window.__ModuleLoader__.load({
             )
           : null,
         chart,
+        chart === null
+          ? null
+          : h(
+              'p',
+              { className: 'dsh-bal-token-hover' },
+              hoverText ?? tr('tokens.hoverHint', 'Hover a bar to see exact tokens'),
+            ),
+        providerRows.length > 0
+          ? h(
+              'div',
+              { className: 'dsh-bal-token-legend' },
+              providerRows.map((provider) => {
+                const share = total === 0 ? 0 : Math.round((provider.total / total) * 100);
+                const title = `${tokenProviderLabel(provider)} · ${tr('tokens.total', 'Total')} ${exactTokenCount(provider.total)} · ${tr('tokens.input', 'Input')} ${exactTokenCount(provider.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(provider.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(provider.cacheRead)} · ${provider.requests} ${tr('tokens.requests', 'requests')}`;
+                return h(
+                  'span',
+                  { key: provider.id, title },
+                  h('i', { style: { background: provider.color }, 'aria-hidden': true }),
+                  `${tokenProviderLabel(provider)} ${formatTokenCount(provider.total)}`,
+                  h('em', null, `${share}%`),
+                );
+              }),
+            )
+          : null,
         data !== null && total > 0
           ? h(
               'p',
@@ -1582,7 +1761,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** The full balance page registered in the `main` slot. */
+    /** The full balance page registered in the `main` slot. */    /** The full balance page registered in the `main` slot. */
     function BalancePage() {
       const state = useStore();
       const snapshot = state.snapshot;

@@ -1221,8 +1221,8 @@ export function apply(ctx, config) {
     return { key: year, label: year };
   };
 
-  /** One empty token bucket. */
-  const emptyTokenBucket = () => ({
+  /** One empty token counter. */
+  const emptyTokenCounts = () => ({
     total: 0,
     input: 0,
     output: 0,
@@ -1230,6 +1230,30 @@ export function apply(ctx, config) {
     cacheWrite: 0,
     requests: 0,
   });
+
+  /** One empty bucket, including its per-provider breakdown. */
+  const emptyTokenBucket = () => ({ ...emptyTokenCounts(), providers: {} });
+
+  /** Add one usage row to a counter. */
+  const addTokenCounts = (target, row) => {
+    target.total += row.total;
+    target.input += row.input;
+    target.output += row.output;
+    target.cacheRead += row.cacheRead;
+    target.cacheWrite += row.cacheWrite;
+    target.requests += 1;
+  };
+
+  /** Human-readable fallback label for a logged provider route. */
+  const tokenProviderLabel = (provider) => {
+    if (provider === 'deepseek-official') return 'DeepSeek 账号';
+    if (provider === 'deepseek') return 'DeepSeek API';
+    if (provider === 'opencode-go') return 'OpenCode Go';
+    if (provider === 'opencode') return 'OpenCode';
+    if (provider === 'unknown' || provider === '') return '未知';
+    const name = providerName(provider);
+    return typeof name === 'string' && name !== '' ? name : provider;
+  };
 
   /** Scan every persisted session and fold provider-reported token usage by local time. */
   const scanTokenStats = async () => {
@@ -1248,19 +1272,18 @@ export function apply(ctx, config) {
       month: new Map(),
       year: new Map(),
     };
-    const totals = emptyTokenBucket();
+    const totals = emptyTokenCounts();
+    const providerTotals = new Map();
     let errors = 0;
     let scanned = 0;
     const queue = Array.isArray(records) ? [...records] : [];
-    const add = (kind, date, usage) => {
+    const add = (kind, date, usage, provider) => {
       const bucket = tokenBucket(date, kind);
       const entry = maps[kind].get(bucket.key) ?? emptyTokenBucket();
-      entry.total += usage.total;
-      entry.input += usage.input;
-      entry.output += usage.output;
-      entry.cacheRead += usage.cacheRead;
-      entry.cacheWrite += usage.cacheWrite;
-      entry.requests += 1;
+      addTokenCounts(entry, usage);
+      const current = entry.providers[provider] ?? emptyTokenCounts();
+      addTokenCounts(current, usage);
+      entry.providers[provider] = current;
       maps[kind].set(bucket.key, entry);
     };
     const worker = async () => {
@@ -1273,8 +1296,17 @@ export function apply(ctx, config) {
           scanned += 1;
           const events = Array.isArray(log.events) ? log.events : [];
           const inherited = Math.max(0, Number(log.inheritedEventCount) || 0);
-          for (let index = inherited; index < events.length; index += 1) {
+          let provider = '';
+          for (let index = 0; index < events.length; index += 1) {
             const event = events[index];
+            if (event?.type === 'request/header') {
+              const value = event.data?.header?.config?.provider;
+              if (typeof value === 'string' && value !== '') provider = value;
+            } else if (event?.type === 'request/context') {
+              const value = event.data?.provider;
+              if (typeof value === 'string' && value !== '') provider = value;
+            }
+            if (index < inherited) continue;
             if (event?.type !== 'assistant/message') continue;
             const usage = event.data?.usage;
             if (usage === null || typeof usage !== 'object') continue;
@@ -1298,16 +1330,15 @@ export function apply(ctx, config) {
               cacheRead,
               cacheWrite,
             };
-            totals.total += row.total;
-            totals.input += row.input;
-            totals.output += row.output;
-            totals.cacheRead += row.cacheRead;
-            totals.cacheWrite += row.cacheWrite;
-            totals.requests += 1;
-            add('hour', date, row);
-            add('day', date, row);
-            add('month', date, row);
-            add('year', date, row);
+            addTokenCounts(totals, row);
+            const providerId = provider !== '' ? provider : 'unknown';
+            const providerEntry = providerTotals.get(providerId) ?? emptyTokenCounts();
+            addTokenCounts(providerEntry, row);
+            providerTotals.set(providerId, providerEntry);
+            add('hour', date, row, providerId);
+            add('day', date, row, providerId);
+            add('month', date, row, providerId);
+            add('year', date, row, providerId);
           }
         } catch {
           errors += 1;
@@ -1347,6 +1378,9 @@ export function apply(ctx, config) {
       }
       return out;
     };
+    const providers = [...providerTotals.entries()]
+      .map(([id, stats]) => ({ id, label: tokenProviderLabel(id), ...stats }))
+      .sort((left, right) => right.total - left.total);
     const timeZone = 'Asia/Shanghai';
     return {
       ok: true,
@@ -1356,6 +1390,7 @@ export function apply(ctx, config) {
       scanned,
       errors,
       totals,
+      providers,
       buckets: {
         hour: range('hour', 24),
         day: range('day', 30),
