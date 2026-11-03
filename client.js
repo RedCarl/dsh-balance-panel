@@ -301,8 +301,8 @@ window.__ModuleLoader__.load({
       }
       .dsh-bal-updateline.error { color: var(--dsw-alias-state-error-primary); }
       .dsh-bal-tokens {
-        margin-top: 24px;
-        padding-top: 16px;
+        margin-top: 20px;
+        padding-top: 14px;
         border-top: 0.5px solid var(--dsw-alias-border-l1);
       }
       .dsh-bal-token-head {
@@ -355,11 +355,44 @@ window.__ModuleLoader__.load({
         outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-brand-primary));
         outline-offset: 1px;
       }
+      .dsh-bal-token-chartWrap {
+        position: relative;
+        margin-top: 8px;
+      }
       .dsh-bal-token-chart {
         display: block;
         width: 100%;
         height: auto;
-        margin-top: 8px;
+      }
+      .dsh-bal-token-tip {
+        position: absolute;
+        z-index: 2;
+        max-width: min(340px, 88vw);
+        padding: 6px 8px;
+        border: 0.5px solid var(--dsw-alias-border-l2);
+        border-radius: 6px;
+        background: var(--dsw-alias-bg-base);
+        box-shadow: 0 4px 14px rgb(0 0 0 / 0.18);
+        color: var(--dsw-alias-label-primary);
+        font-size: 11px;
+        line-height: 16px;
+        pointer-events: none;
+        white-space: normal;
+      }
+      .dsh-bal-token-tip-title {
+        color: var(--dsw-alias-label-secondary);
+        font-size: 10px;
+        line-height: 15px;
+      }
+      .dsh-bal-token-tip-value {
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
+      }
+      .dsh-bal-token-tip-detail {
+        color: var(--dsw-alias-label-secondary);
+        font-variant-numeric: tabular-nums;
+        font-size: 10px;
+        line-height: 15px;
       }
       .dsh-bal-token-chart text {
         fill: var(--dsw-alias-label-secondary);
@@ -407,8 +440,8 @@ window.__ModuleLoader__.load({
         line-height: 17px;
       }
       .dsh-bal-health {
-        margin-top: 24px;
-        padding-top: 16px;
+        margin-top: 20px;
+        padding-top: 14px;
         border-top: 0.5px solid var(--dsw-alias-border-l1);
       }
       .dsh-bal-health-title {
@@ -486,6 +519,7 @@ window.__ModuleLoader__.load({
         padding: 13px 0;
         border-bottom: 0.5px solid var(--dsw-alias-border-l1);
       }
+      .dsh-bal-row:last-child { border-bottom: 0; }
       .dsh-bal-platform {
         display: flex;
         align-items: center;
@@ -1517,7 +1551,11 @@ window.__ModuleLoader__.load({
 
     /** Compact year/month/day/hour token chart, stacked by provider/account. */
     function TokenStats({ tokens, onTab }) {
+      const [tip, setTip] = React.useState(null);
       const tab = tokens.tab;
+      React.useEffect(() => {
+        setTip(null);
+      }, [tab]);
       const data = tokens.data;
       const ranges = Array.isArray(data?.buckets?.[tab]) ? data.buckets[tab] : [];
       const total = ranges.reduce((sum, bucket) => sum + (Number(bucket.total) || 0), 0);
@@ -1568,47 +1606,50 @@ window.__ModuleLoader__.load({
       const labelIndices = [
         ...new Set([0, Math.floor((count - 1) / 3), Math.floor((2 * (count - 1)) / 3), count - 1]),
       ].filter((index) => index >= 0 && index < count);
-      const hoverFor = (provider, bucket, stats) =>
-        [
-          `${tokenProviderLabel(provider)} · ${bucket.label}`,
-          `${exactTokenCount(stats.total)} tokens`,
-          `${tr('tokens.input', 'Input')} ${exactTokenCount(stats.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(stats.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(stats.cacheRead)}`,
-        ].join('\n');
+      const hoverFor = (provider, bucket, stats) => ({
+        title: `${tokenProviderLabel(provider)} · ${bucket.label}`,
+        value: `${exactTokenCount(stats.total)} tokens`,
+        detail: `${tr('tokens.input', 'Input')} ${exactTokenCount(stats.input)} · ${tr('tokens.output', 'Output')} ${exactTokenCount(stats.output)} · ${tr('tokens.cacheRead', 'Cache read')} ${exactTokenCount(stats.cacheRead)}`,
+      });
       const chart =
         total === 0
           ? null
           : h(
-              'svg',
+              'div',
               {
-                className: 'dsh-bal-token-chart',
-                viewBox: `0 0 ${width} ${height}`,
-                role: 'img',
-                'aria-label': `${tr('tokens.title', 'Token usage')} ${tokenRangeText(tab)} ${formatTokenCount(total)}`,
+                className: 'dsh-bal-token-chartWrap',
+                onMouseLeave: () => setTip(null),
               },
-              h('line', {
-                x1: 0,
-                y1: plot,
-                x2: width,
-                y2: plot,
-                stroke: 'var(--dsw-alias-border-l1)',
-                strokeWidth: 1,
-              }),
-              ranges.flatMap((bucket, index) => {
-                let offset = 0;
-                const segments = [];
-                for (const provider of providerRows) {
-                  const stats = bucket.providers?.[provider.id];
-                  const value = Number(stats?.total) || 0;
-                  if (value <= 0) continue;
-                  const segmentHeight = (value / max) * plot;
-                  const x = index * slot + (slot - barWidth) / 2;
-                  const y = plot - offset - segmentHeight;
-                  offset += segmentHeight;
-                  const text = hoverFor(provider, bucket, stats);
-                  segments.push(
-                    h(
-                      'rect',
-                      {
+              h(
+                'svg',
+                {
+                  className: 'dsh-bal-token-chart',
+                  viewBox: `0 0 ${width} ${height}`,
+                  role: 'img',
+                  'aria-label': `${tr('tokens.title', 'Token usage')} ${tokenRangeText(tab)} ${formatTokenCount(total)}`,
+                },
+                h('line', {
+                  x1: 0,
+                  y1: plot,
+                  x2: width,
+                  y2: plot,
+                  stroke: 'var(--dsw-alias-border-l1)',
+                  strokeWidth: 1,
+                }),
+                ranges.flatMap((bucket, index) => {
+                  let offset = 0;
+                  const segments = [];
+                  for (const provider of providerRows) {
+                    const stats = bucket.providers?.[provider.id];
+                    const value = Number(stats?.total) || 0;
+                    if (value <= 0) continue;
+                    const segmentHeight = (value / max) * plot;
+                    const x = index * slot + (slot - barWidth) / 2;
+                    const y = plot - offset - segmentHeight;
+                    offset += segmentHeight;
+                    const content = hoverFor(provider, bucket, stats);
+                    segments.push(
+                      h('rect', {
                         key: `${bucket.key}-${provider.id}`,
                         className: 'dsh-bal-token-bar',
                         x,
@@ -1618,25 +1659,59 @@ window.__ModuleLoader__.load({
                         rx: 1.5,
                         fill: provider.color,
                         tabIndex: 0,
-                      },
-                      h('title', null, text),
-                    ),
-                  );
-                }
-                return segments;
-              }),
-              labelIndices.map((index) =>
-                h(
-                  'text',
-                  {
-                    key: `label-${index}`,
-                    x: (index + 0.5) * slot,
-                    y: 88,
-                    textAnchor: 'middle',
-                  },
-                  ranges[index].label,
+                        'aria-label': `${content.title} ${content.value} ${content.detail}`,
+                        onMouseEnter: () =>
+                          setTip({
+                            ...content,
+                            left: ((x + barWidth / 2) / width) * 100,
+                            top: (y / height) * 100,
+                            below: y < 24,
+                          }),
+                        onFocus: () =>
+                          setTip({
+                            ...content,
+                            left: ((x + barWidth / 2) / width) * 100,
+                            top: (y / height) * 100,
+                            below: y < 24,
+                          }),
+                        onBlur: () => setTip(null),
+                      }),
+                    );
+                  }
+                  return segments;
+                }),
+                labelIndices.map((index) =>
+                  h(
+                    'text',
+                    {
+                      key: `label-${index}`,
+                      x: (index + 0.5) * slot,
+                      y: 88,
+                      textAnchor: 'middle',
+                    },
+                    ranges[index].label,
+                  ),
                 ),
               ),
+              tip === null
+                ? null
+                : h(
+                    'div',
+                    {
+                      className: 'dsh-bal-token-tip',
+                      'aria-hidden': true,
+                      style: {
+                        left: `clamp(170px, ${tip.left}%, calc(100% - 170px))`,
+                        top: `${tip.top}%`,
+                        transform: tip.below
+                          ? 'translate(-50%, 8px)'
+                          : 'translate(-50%, calc(-100% - 8px))',
+                      },
+                    },
+                    h('div', { className: 'dsh-bal-token-tip-title' }, tip.title),
+                    h('div', { className: 'dsh-bal-token-tip-value' }, tip.value),
+                    h('div', { className: 'dsh-bal-token-tip-detail' }, tip.detail),
+                  ),
             );
       const subtitle =
         data === null
@@ -1699,7 +1774,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** The full balance page registered in the `main` slot. */    /** The full balance page registered in the `main` slot. */    /** The full balance page registered in the `main` slot. */
+    /** The full balance page registered in the `main` slot. */
     function BalancePage() {
       const state = useStore();
       const snapshot = state.snapshot;
