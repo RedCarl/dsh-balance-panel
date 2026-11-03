@@ -496,6 +496,32 @@ async function queryProvider(adapter, options) {
   }
 }
 
+/** Render an update failure without ever falling back to "[object Object]". */
+function failureText(value) {
+  if (typeof value === 'string') return value;
+  if (value instanceof Error) return value.message;
+  if (value !== null && typeof value === 'object') {
+    const code = typeof value.code === 'string' ? value.code : '';
+    const detail =
+      typeof value.diagnostic === 'string'
+        ? value.diagnostic
+        : typeof value.message === 'string' && value.message !== '[object Object]'
+          ? value.message
+          : typeof value.reason === 'string'
+            ? value.reason
+            : '';
+    if (code !== '' && detail !== '' && detail !== code) return `${code}: ${detail}`;
+    if (code !== '') return code;
+    if (detail !== '') return detail;
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value ?? '');
+}
+
 /** Read a small JSON request body. */
 async function readRequestBody(req, limit = 8192) {
   let text = '';
@@ -1002,9 +1028,7 @@ export function apply(ctx, config) {
         };
       }
       const failure =
-        result.error === undefined
-          ? undefined
-          : (result.error.message ?? String(result.error));
+        result.error === undefined ? undefined : failureText(result.error);
       if (result.application === 'failed') {
         return {
           ok: false,
@@ -1818,7 +1842,7 @@ export function apply(ctx, config) {
               sendJson(res, 500, {
                 ok: false,
                 currentVersion: PLUGIN_VERSION,
-                error: error instanceof Error ? error.message : String(error),
+                error: failureText(error),
               });
             }
             return;
@@ -1860,7 +1884,7 @@ export function apply(ctx, config) {
           } catch (error) {
             sendJson(res, 500, {
               ok: false,
-              error: error instanceof Error ? error.message : String(error),
+              error: failureText(error),
             });
           }
         },

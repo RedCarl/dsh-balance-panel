@@ -930,7 +930,34 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Apply the latest GitHub release; the Host reloads its own plugin entry. */
+    /** Render an update failure object as readable text. */
+    function updateFailureText(result) {
+      const values = [result?.failure, result?.error];
+      for (const value of values) {
+        if (typeof value === 'string' && value !== '' && value !== '[object Object]') return value;
+        if (value === null || typeof value !== 'object') continue;
+        const code = typeof value.code === 'string' ? value.code : '';
+        const detail =
+          typeof value.diagnostic === 'string'
+            ? value.diagnostic
+            : typeof value.message === 'string' && value.message !== '[object Object]'
+              ? value.message
+              : typeof value.reason === 'string'
+                ? value.reason
+                : '';
+        if (code !== '' && detail !== '' && detail !== code) return `${code}: ${detail}`;
+        if (code !== '') return code;
+        if (detail !== '') return detail;
+        try {
+          return JSON.stringify(value);
+        } catch {
+          // Fall through to the generic label.
+        }
+      }
+      return '';
+    }
+
+    /** Apply the latest release; the Host reloads its own plugin entry. */
     async function performUpdate() {
       const before = store.get();
       if (before.update.updating) return;
@@ -953,14 +980,15 @@ window.__ModuleLoader__.load({
         const result = await response.json().catch(() => null);
         const current = store.get();
         if (result === null || typeof result !== 'object' || result.ok !== true) {
+          const failure = result === null ? '' : updateFailureText(result);
           store.set({
             ...current,
             update: {
               ...current.update,
               updating: false,
-              message: result?.error ?? tr('update.failed', 'Update failed'),
+              message: failure || tr('update.failed', 'Update failed'),
               messageError: true,
-              error: result?.error ?? `HTTP ${response.status}`,
+              error: failure || `HTTP ${response.status}`,
             },
           });
           return;

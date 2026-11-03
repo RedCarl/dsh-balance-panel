@@ -71,6 +71,24 @@ Token 用量取 provider 在 `assistant/message` 中报告的值，包含缓存�
 
 更新只访问私有源，不读取或上传任何密钥。
 
+## 更新失败时
+
+旧版本（例如 1.3.0）的页内更新在安装失败时可能只显示 `[object Object]`；
+1.4.2 起会显示插件管理器返回的错误码和诊断。若目前卡在旧版本，可直接在目标机器执行：
+
+```sh
+dsh plugin --profile web add @local/dsh-balance-panel@1.4.2
+```
+
+如果 profile 启用了 pnpm 的 `minimumReleaseAge`，或版本解析不可用，改用 tarball 直装：
+
+```sh
+dsh plugin --profile web add https://npm.carljoy.cn/@local/dsh-balance-panel/-/dsh-balance-panel-1.4.2.tgz
+```
+
+也可以在 `https://npm.carljoy.cn/` 下载 tgz 后粘贴本地绝对路径安装。
+安装后刷新页面即可。
+
 ## 静默刷新
 
 每次会话完成一轮（Host 的 `agent/status` 变为 `idle`）后，插件仍在后台重新查询余额，但不再显示圆点或提醒条；侧栏金额/用量和页面数据会直接更新。需要立即刷新时，用页面右上角的刷新按钮。
